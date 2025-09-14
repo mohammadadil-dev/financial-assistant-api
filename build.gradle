@@ -1,0 +1,53 @@
+plugins {
+	id 'java'
+	id 'org.springframework.boot' version '3.5.3'
+	id 'io.spring.dependency-management' version '1.1.7'
+}
+
+group = 'com.beginner-techies'
+version = '0.0.1-SNAPSHOT'
+
+java {
+	toolchain {
+		languageVersion = JavaLanguageVersion.of(21)
+	}
+}
+
+ext {
+  set('springAiVersion', "1.0.0-M8")
+}
+
+repositories {
+	mavenCentral()
+	maven { url 'https://repo.spring.io/milestone' }
+}
+
+dependencies {
+	implementation 'org.springframework.boot:spring-boot-starter-web'
+	//implementation 'org.springframework.ai:spring-ai-openai-spring-boot-starter'
+	implementation 'org.springframework.ai:spring-ai-starter-vector-store-pinecone'
+	
+	implementation 'org.springframework.ai:spring-ai-advisors-vector-store'
+	
+	//implementation 'org.springframework.ai:spring-ai-starter-model-openai'	
+	
+	implementation 'org.springframework.ai:spring-ai-starter-model-ollama'
+	implementation "io.pinecone:pinecone-client:5.1.0"
+	compileOnly 'org.projectlombok:lombok:1.18.30'
+    annotationProcessor 'org.projectlombok:lombok:1.18.30'
+    // https://mvnrepository.com/artifact/org.springframework.boot/spring-boot-devtools
+	implementation 'org.springframework.boot:spring-boot-devtools:3.5.3'
+	
+	testImplementation 'org.springframework.boot:spring-boot-starter-test'
+	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.named('test') {
+	useJUnitPlatform()
+}
+
+dependencyManagement {
+  imports {
+    mavenBom "org.springframework.ai:spring-ai-bom:${springAiVersion}"
+  }
+}
