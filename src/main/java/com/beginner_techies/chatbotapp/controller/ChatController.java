@@ -11,7 +11,7 @@ import com.beginner_techies.chatbotapp.service.ChatbotService;
 
 import lombok.extern.slf4j.Slf4j;
 
-record ChatRequest(String content, String sender) {
+record ChatRequest(String content, String sender, String lang) {
 }
 
 record ApiError(String error, String message) {
@@ -31,7 +31,7 @@ public class ChatController {
 				return ResponseEntity.badRequest().body(new ApiError("BadRequest", "content is required"));
 			}
 			String userId = (req.sender() == null || req.sender().isBlank()) ? "anonymous" : req.sender();
-			ChatReply reply = chatbotService.handleMessage(userId, req.content());
+			ChatReply reply = chatbotService.handleMessage(userId, req.content(), req.lang());
 			return ResponseEntity.ok(reply);
 		} catch (Exception e) {
 			log.error("chat error", e);

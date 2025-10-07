@@ -11,7 +11,7 @@ import org.springframework.stereotype.Service;
 import com.beginner_techies.chatbotapp.config.DocumentLoader;
 import com.beginner_techies.chatbotapp.dto.EligibilityState;
 import com.beginner_techies.chatbotapp.dto.IntentResult;
-import com.beginner_techies.chatbotapp.enums.AccountType;
+import com.beginner_techies.chatbotapp.enums.LoanAppStatus;
 import com.beginner_techies.chatbotapp.enums.LoanType;
 import com.beginner_techies.chatbotapp.record.ChatOption;
 import com.beginner_techies.chatbotapp.record.ChatReply;
@@ -28,6 +28,7 @@ public class ChatbotService {
 	private final FinanceTools tools;
 	private final RateService rateService;
 	private final DocumentLoader documentLoader;
+	private final LoanService loanService; // <-- NEW
 
 	private static final String SYSTEM = """
 			You are a bilingual (Arabic + English) finance assistant for customers in the KSA.
@@ -40,7 +41,7 @@ public class ChatbotService {
 
 	public ChatbotService(ChatClient chatClient, VectorStore vectorStore, IntentDetectorService router,
 			EligibilitySessionStore sessions, EligibilityService eligibility, FinanceTools tools,
-			RateService rateService, DocumentLoader documentLoader) {
+			RateService rateService, DocumentLoader documentLoader, LoanService loanService) {
 		this.chatClient = chatClient;
 		this.vectorStore = vectorStore;
 		this.router = router;
@@ -49,17 +50,26 @@ public class ChatbotService {
 		this.tools = tools;
 		this.rateService = rateService;
 		this.documentLoader = documentLoader;
+		this.loanService = loanService;
 	}
 
 	// ====== Public entrypoint ======
-	public ChatReply handleMessage(String userId, String userMessageRaw) {
+	public ChatReply handleMessage(String userId, String userMessageRaw, String langFromClient) {
 		// 0) Extract plain text (supports {"content":"..."} or {"message":"..."})
 		String raw = extractMessage(userMessageRaw);
 		String lower = raw == null ? "" : raw.trim().toLowerCase();
+		var state = sessions.get(userId);
 
 		// 1) Update language from THIS message so reply matches user
-		sessions.setLangByMessage(userId, raw);
-		var state = sessions.get(userId);
+		if (langFromClient != null && (langFromClient.equals("ar") || langFromClient.equals("en"))) {
+			state.setLang(langFromClient);
+			sessions.lockLang(userId, true); // 👈 new: mark sticky
+		} else {
+			// No explicit lang passed → only auto-detect if not locked
+			if (!sessions.isLangLocked(userId)) {
+				sessions.setLangByMessage(userId, raw); // your existing detector
+			}
+		}
 		String lang = state.lang();
 
 		// --- map quick-pick ids for income → payload (defensive)
@@ -69,20 +79,20 @@ public class ChatbotService {
 			raw = "ar".equals(lang) ? "دخل 15000" : "income 15000";
 		if ("inc20k".equalsIgnoreCase(lower))
 			raw = "ar".equals(lang) ? "دخل 20000" : "income 20000";
-		
+
 		if ("nat_sa".equalsIgnoreCase(lower) || "saudi".equalsIgnoreCase(lower)) {
-		    raw = "nationality Saudi";
+			raw = "nationality Saudi";
 		}
-		if ("nat_nonsa".equalsIgnoreCase(lower)
-		        || "non_saudi".equalsIgnoreCase(lower)
-		        || "non-saudi".equalsIgnoreCase(lower)
-		        || "non saudi".equalsIgnoreCase(lower)
-		        || "expat".equalsIgnoreCase(lower)) {
-		    raw = "nationality Non-Saudi";
+		if ("nat_nonsa".equalsIgnoreCase(lower) || "non_saudi".equalsIgnoreCase(lower)
+				|| "non-saudi".equalsIgnoreCase(lower) || "non saudi".equalsIgnoreCase(lower)
+				|| "expat".equalsIgnoreCase(lower)) {
+			raw = "nationality Non-Saudi";
 		}
 		// Arabic direct tokens (if user typed them literally)
-		if (raw.contains("الجنسية سعودي")) raw = "nationality Saudi";
-		if (raw.contains("الجنسية غير سعودي") || raw.contains("غير سعودي")) raw = "nationality Non-Saudi";
+		if (raw.contains("الجنسية سعودي"))
+			raw = "nationality Saudi";
+		if (raw.contains("الجنسية غير سعودي") || raw.contains("غير سعودي"))
+			raw = "nationality Non-Saudi";
 
 		// 🔧 recompute lower AFTER raw may have been changed
 		lower = raw == null ? "" : raw.trim().toLowerCase();
@@ -104,20 +114,24 @@ public class ChatbotService {
 		}
 
 		// Language toggles
-		if (lower.equals("lang ar")) {
+		if (lower.equals("lang ar") || lower.equals("lang_ar") || raw.equals("العربية")) {
 			state.setLang("ar");
 			return assistanceMenu("ar");
 		}
-		if (lower.equals("lang en")) {
+		if (lower.equals("lang en") || lower.equals("lang_en") || lower.equals("english")) {
 			state.setLang("en");
 			return assistanceMenu("en");
 		}
 
+		String natIdCandidate = normalizeToLatinDigits(raw).replaceAll("[^0-9]", "");
+		if (natIdCandidate.matches("^\\d{10}$")) {
+			return handleLoanStatusFlow(state, raw);
+		}
 		// ---------------- Global shortcuts (no LLM) ----------------
 
 		// Menu
 		if (isMenuCommand(raw)) {
-			return assistanceMenu(lang);
+			return assistanceMenu(sessions.get(userId).lang());
 		}
 
 		// Reset
@@ -162,36 +176,23 @@ public class ChatbotService {
 			return afterLoanTypeChosen(state);
 		}
 
-		// ---------------- Account opening (no LLM) ----------------
-		if (lower.matches("^(open(ing)?\\s+an?\\s*account|open\\s*account|account\\s*opening)$")
-				|| raw.contains("فتح حساب") || raw.contains("فتح حساب بنكي")) {
-			return handleOpenAccount(state);
-		}
-
-		// Account type choices
-		if (lower.equals("acct_saving") || lower.contains("savings account") || raw.contains("حساب توفير")) {
-			return handleAccountTypeDetails(state, AccountType.SAVINGS);
-		}
-		if (lower.equals("acct_current") || lower.contains("current account") || raw.contains("حساب جاري")) {
-			return handleAccountTypeDetails(state, AccountType.CURRENT);
-		}
-		if (lower.equals("acct_salary") || lower.contains("salary account") || raw.contains("حساب راتب")) {
-			return handleAccountTypeDetails(state, AccountType.SALARY);
-		}
-
 		// Start account application
-		if (lower.equals("acct_start") || lower.equals("i want to open an account")
-				|| raw.contains("أرغب في فتح حساب")) {
-			return ChatReply.options(
-					lang.equals("ar") ? "رائع! سنبدأ بزيارة التحقق من الهوية (KYC)."
-							: "Great! Let’s begin with identity verification (KYC).",
-					withNav(List.of(
-							new ChatOption("kyc_start",
-									lang.equals("ar") ? "ابدأ التحقق من الهوية" : "Start identity verification",
-									lang.equals("ar") ? "أريد بدء التحقق" : "I want to start verification"),
-							new ChatOption("contact", lang.equals("ar") ? "التحدث إلى موظف" : "Talk to an agent",
-									lang.equals("ar") ? "أريد التحدث إلى موظف" : "I want to talk to a human agent")),
-							lang));
+		if (lower.equals("apply_loan") || lower.equals("i want to apply loan") || raw.contains("تطبيق القرض")) {
+			String applyUrl = getApplyUrl(state.getLoanType()); // see helper below
+			String msg = lang.equals("ar")
+					? ("قدّم طلب التمويل عبر الرابط التالي:\n" + applyUrl + "\n\n"
+							+ "بعد التقديم سنخبرك بالخطوات التالية.")
+					: ("Apply for your financing using this link:\n" + applyUrl + "\n\n"
+							+ "We’ll guide you on the next steps after you submit.");
+
+			// Primary action opens the link; others keep chat going
+			var opts = new java.util.ArrayList<ChatOption>();
+			opts.add(new ChatOption("open_apply", lang.equals("ar") ? "فتح نموذج التقديم" : "Open application",
+					applyUrl));
+			opts.add(
+					new ChatOption("docs", lang.equals("ar") ? "الأسئلة الشائعة / المستندات" : "FAQs / Documents", ""));
+			opts.add(new ChatOption("contact", lang.equals("ar") ? "التحدث إلى موظف" : "Talk to an agent", ""));
+			return ChatReply.options(msg, withNav(opts, lang));
 		}
 
 		// ---------------- Direct command shortcuts (no LLM) ----------------
@@ -240,10 +241,55 @@ public class ChatbotService {
 			return askForMissingEligibility(state);
 		}
 
+		if (lower.contains("status") || raw.contains("حالة") || raw.contains("متابعة الطلب")
+				|| raw.contains("تتبع الطلب")) {
+			return handleLoanStatusFlow(state, raw);
+		}
+
+		String maybeId = extractNationalId(raw);
+		if (maybeId != null && (lower.length() == 10 || lower.matches("^\\s*\\d{10}\\s*$"))) {
+			return handleLoanStatusFlow(state, raw);
+		}
+
+		if (lower.equals("track") || lower.contains("track application") || raw.contains("متابعة الطلب")
+				|| raw.contains("تتبع الطلب")) {
+			return handleTrackApplicationStart(state);
+		}
+
 		// ---------------- Router / LLM (only if nothing matched) ----------------
 		var intent = router.detect(raw, state.lang()); // pass RAW + detected lang
 		state = sessions.merge(userId, intent); // merge slots
 		return routeIntent(intent, state, raw, userId);
+	}
+
+	private ChatReply handleTrackApplicationStart(EligibilityState state) {
+		boolean ar = "ar".equals(state.lang());
+		String prompt = ar ? "من أجل متابعة طلبك، الرجاء إدخال رقم الهوية الوطنية (10 أرقام):"
+				: "To track your application, please enter your National ID (10 digits):";
+
+		// Helpful examples as buttons (no payload to avoid leaking IDs)
+		var opts = new ArrayList<ChatOption>();
+		if (ar) {
+			opts.add(new ChatOption("track_help", "مثال: 1234567890", ""));
+			opts.add(new ChatOption("contact", "التحدث إلى موظف", ""));
+		} else {
+			opts.add(new ChatOption("track_help", "Example: 1234567890", ""));
+			opts.add(new ChatOption("contact", "Talk to an agent", ""));
+		}
+		return ChatReply.options(prompt, withNav(opts, state.lang()));
+	}
+
+	private String getApplyUrl(LoanType type) {
+		// TODO: put your real application URLs here
+		final String DEFAULT = "https://your-fintech.com/apply";
+		if (type == null)
+			return DEFAULT;
+
+		return switch (type) {
+		case PERSONAL -> "https://your-fintech.com/apply/personal";
+		case AUTO -> "https://your-fintech.com/apply/auto";
+		case MORTGAGE, HOME -> "https://your-fintech.com/apply/home";
+		};
 	}
 
 	// ====== Routing ======
@@ -346,125 +392,212 @@ public class ChatbotService {
 	}
 
 	private ChatReply handleEligibility(EligibilityState s) {
-		// Gate: make sure we have the triad; keep asking instead of judging
 		if (s.getLoanType() == null)
 			return loanTypeMenu(s.lang());
 
-		var v = eligibility.evaluateDetailed(s); // <- uses deterministic rules (no LLM)
-		String lang = s.lang();
-		boolean ar = "ar".equals(lang);
+		var v = eligibility.evaluateDetailed(s);
+		var ar = "ar".equals(s.lang());
 
-		// Helper lambdas for localized strings
-		java.util.function.Function<String, String> lz = code -> switch (code) {
+		java.util.function.Function<String, String> L = code -> switch (code) {
 		case "NEED_INCOME" -> ar ? "ما هو دخلك الشهري؟" : "What is your monthly income?";
 		case "NEED_EMPLOYER_TYPE" -> ar ? "ما نوع جهة عملك؟ (حكومي/خاص/متعاقد/عمل حر)"
 				: "What is your employer type? (government/private/contract/self-employed)";
 		case "NEED_SERVICE_MONTHS" ->
-			ar ? "كم شهراً عملت لدى جهة عملك الحالية؟" : "How many months have you been with your current employer?";
-		case "LOW_SERVICE_MONTHS" -> ar ? "مدة الخدمة أقل من الحد الأدنى المطلوب لهذا النوع من جهات العمل."
-				: "Months of service below minimum for this employer type.";
-		case "LOW_INCOME" ->
-			ar ? "الدخل الشهري أقل من الحد الأدنى المطلوب." : "Monthly income below the required minimum.";
-		case "DTI_ABOVE_50" ->
-			ar ? "نسبة الالتزامات إلى الدخل تتجاوز 50٪ حالياً." : "Your debt-to-income ratio currently exceeds 50%.";
-		case "DTI_ABOVE_40" -> ar ? "نسبة الالتزامات إلى الدخل أعلى من 40٪ الموصى بها."
-				: "Your debt-to-income ratio is above the typical 40% guideline.";
+			ar ? "كم شهراً لدى جهة عملك الحالية؟" : "How many months with your current employer?";
+		case "LOW_INCOME" -> ar ? "الدخل أقل من الحد الأدنى المطلوب." : "Income is below the minimum.";
+		case "LOW_SERVICE_MONTHS" -> ar ? "مدة الخدمة أقل من المطلوب." : "Months of service are below minimum.";
+		case "DTI_ABOVE_CAP" ->
+			ar ? "نسبة الالتزامات إلى الدخل أعلى من الحد المسموح." : "Debt-to-income ratio exceeds the allowed cap.";
 		default -> code;
 		};
 
-		// Build message
-		StringBuilder msg = new StringBuilder();
-		switch (v.status) {
-		case NEED_INFO -> {
-			msg.append(ar ? "قبل إعطاء تقييم أوّلي، أحتاج بعض المعلومات:"
-					: "Before giving a preliminary assessment, I need a couple of details:");
-			for (String r : v.reasons) {
-				msg.append(ar ? "\n• " : "\n• ").append(lz.apply(r));
-			}
-			// Offer quick slot buttons
-			var opts = new java.util.ArrayList<ChatOption>();
-			if (s.getMonthlyIncome() == null) {
-				opts.add(
-						new ChatOption("inc10k", ar ? "10,000 ريال" : "10,000 SAR", ar ? "دخل 10000" : "income 10000"));
-				opts.add(
-						new ChatOption("inc15k", ar ? "15,000 ريال" : "15,000 SAR", ar ? "دخل 15000" : "income 15000"));
-				opts.add(
-						new ChatOption("inc20k", ar ? "20,000 ريال" : "20,000 SAR", ar ? "دخل 20000" : "income 20000"));
-			}
-			if (s.getEmployerType() == null) {
-				opts.add(new ChatOption("emp_gov", ar ? "حكومي" : "Government",
-						ar ? "جهة العمل حكومي" : "employer government"));
-				opts.add(new ChatOption("emp_priv", ar ? "خاص" : "Private", ar ? "جهة العمل خاص" : "employer private"));
-				opts.add(new ChatOption("emp_cont", ar ? "متعاقد" : "Contract",
-						ar ? "جهة العمل متعاقد" : "employer contract"));
-				opts.add(new ChatOption("emp_self", ar ? "عمل حر" : "Self-employed",
-						ar ? "جهة العمل عمل حر" : "employer self"));
-			}
-			if (s.getServiceMonths() == null) {
-				opts.add(new ChatOption("srv6", ar ? "6 أشهر" : "6 months", ar ? "خدمة 6 شهر" : "service 6 months"));
-				opts.add(new ChatOption("srv12", ar ? "12 شهرًا" : "12 months",
-						ar ? "خدمة 12 شهر" : "service 12 months"));
-				opts.add(new ChatOption("srv24", ar ? "24 شهرًا" : "24 months",
-						ar ? "خدمة 24 شهر" : "service 24 months"));
-			}
-			return ChatReply.options(msg.toString(), withNav(opts, lang));
+		// If still missing data → keep prompting
+		if (v.status == EligibilityService.Verdict.Status.NEED_INFO) {
+			StringBuilder b = new StringBuilder(ar ? "قبل التقييم المبدئي، أحتاج هذه التفاصيل:"
+					: "Before a preliminary assessment, I need the following:");
+			for (String r : v.reasons)
+				b.append("\n• ").append(L.apply(r));
+			return ChatReply.options(b.toString(), withNav(java.util.List.of(
+			// your quick-picks here (income, employer type, service months) …
+			), s.lang()));
 		}
 
-		case PRELIM_INELIGIBLE -> {
-			msg.append(ar ? "قد تكون غير مؤهل مبدئيًا بناءً على المعلومات الحالية. هذا ليس قرارًا نهائيًا.\nالأسباب:"
-					: "You may be preliminarily ineligible based on current data. This is not a final decision.\nReasons:");
-			for (String r : v.reasons)
-				msg.append("\n• ").append(lz.apply(r));
+		// Build a personalized offer if feasible
+		Offer offer = buildOffer(s, v);
 
-			// Suggest constructive next steps
-			var opts = new java.util.ArrayList<ChatOption>();
-			opts.add(new ChatOption("emi", ar ? "حساب القسط لمبلغ أقل" : "Try smaller amount",
-					ar ? "مبلغ 100000 مدة 48 شهر" : "amount 100000 tenure 48 months"));
-			opts.add(new ChatOption("emi", ar ? "زيادة مدة السداد" : "Increase tenure",
-					ar ? "مدة 60 شهر" : "tenure 60 months"));
-			opts.add(new ChatOption("elig", ar ? "تحديث الدخل/البيانات" : "Update income/details",
-					ar ? "دخل 12000" : "income 12000"));
+		// Compose the main message by verdict
+		StringBuilder msg = new StringBuilder();
+		var opts = new java.util.ArrayList<ChatOption>();
+
+		switch (v.status) {
+		case PRELIM_INELIGIBLE -> {
+			msg.append(ar ? "قد تكون غير مؤهل مبدئيًا بناءً على المعطيات الحالية:"
+					: "You may be preliminarily ineligible based on current data:");
+			for (String r : v.reasons)
+				msg.append("\n• ").append(L.apply(r));
+
+			if (offer != null && offer.amount > 0) {
+				// Offer a *smaller* path forward (reduce amount or increase tenure)
+				msg.append(ar ? "\n\nاقتراح بديل: حاول مبلغًا أقل أو مدة أطول لنسبة التزام أفضل."
+						: "\n\nAlternative: try a smaller amount or longer tenure for a better DTI.");
+				opts.add(new ChatOption("emi", ar ? "جرّب مدة أطول" : "Try longer tenure",
+						ar ? "مدة 60 شهر" : "tenure 60 months"));
+				opts.add(new ChatOption("chg_amt", ar ? "قلّل مبلغ القرض" : "Reduce loan amount", ""));
+			} else {
+				opts.add(new ChatOption("elig", ar ? "تحديث الدخل/البيانات" : "Update income/details", ""));
+			}
 			opts.add(new ChatOption("contact", ar ? "التحدث إلى موظف" : "Talk to an agent",
 					ar ? "أريد التحدث إلى موظف" : "I want to talk to a human agent"));
-			return ChatReply.options(msg.toString(), withNav(opts, lang));
+			return ChatReply.options(msg.toString(), withNav(opts, s.lang()));
 		}
 
 		case BORDERLINE, PREQUALIFIED -> {
-			// If EMI/DTI available, show them; otherwise keep it brief
-			if (v.estimatedEmi != null && s.getAmount() != null && s.getTenureMonths() != null) {
-				String cur = s.getCurrency() != null ? s.getCurrency() : (ar ? "ريال" : "SAR");
-				String l1 = ar ? "تقييم أوّلي إيجابي." : "Preliminary check looks good.";
-				String l2 = (ar ? "قسط تقريبي ≈ %, .2f %s شهريًا لمبلغ %, .0f %s على %d شهر. معدل سنوي مطبق: %.2f%%."
-						: "Estimated EMI ≈ %, .2f %s / month for %, .0f %s over %d months. Applied annual rate: %.2f%%.")
-						.formatted(v.estimatedEmi, cur, s.getAmount(), cur, s.getTenureMonths(),
-								v.appliedAnnualRate == null ? 0.0 : v.appliedAnnualRate)
-						.replace(" ,", ",");
-				msg.append(l1).append("\n").append(l2);
+			msg.append(v.status == EligibilityService.Verdict.Status.PREQUALIFIED
+					? (ar ? "تقييم مبدئي إيجابي." : "Preliminary check looks good.")
+					: (ar ? "الوضع على الحدود وقد يتطلب مراجعة إضافية." : "Borderline—may require additional review."));
 
-				if (v.dtiRatio != null && v.maxAllowedEmi != null) {
-					double dtiPct = Math.round(v.dtiRatio * 10000.0) / 100.0;
-					String l3 = ar ? ("نسبة الالتزامات إلى الدخل ≈ " + dtiPct + "٪ (الحد الإرشادي 40٪).")
-							: ("DTI ≈ " + dtiPct + "% (typical guideline 40%).");
-					msg.append("\n").append(l3);
-				}
-			} else {
-				msg.append(ar ? "تبدو شروط الأهلية الأساسية مستوفاة.\nهل ترغب بحساب القسط أو متابعة التقديم؟"
-						: "You appear to meet the basic eligibility criteria.\nWould you like to calculate EMI or start an application?");
+			// Attach personalized offer (amount + tenure + EMI)
+			if (offer != null && offer.amount > 0) {
+				String offerLine = ar
+						? ("\nعرض تقريبي: %, .0f %s على %d شهر، قسط ≈ %, .2f %s شهريًا. معدل سنوي مطبق: %.2f%%.")
+						: ("\nIndicative offer: %, .0f %s over %d months, EMI ≈ %, .2f %s / month. Applied annual rate: %.2f%%.");
+				msg.append(offerLine.formatted(offer.amount, offer.currency, offer.tenureMonths, offer.emi,
+						offer.currency, offer.annualRate).replace(" ,", ","));
 			}
 
-			var opts = new java.util.ArrayList<ChatOption>();
+			// Helpful next steps
 			opts.add(new ChatOption("emi", ar ? "حساب القسط (EMI)" : "Calculate EMI",
 					ar ? "حاسبة القسط" : "Calculate EMI"));
-			opts.add(new ChatOption("acct_start", ar ? "بدء التقديم" : "Start application",
-					ar ? "أرغب في فتح حساب" : "I want to open an account"));
+			opts.add(new ChatOption("apply_loan", ar ? "بدء التقديم" : "Apply Loan",
+					ar ? "تطبيق القرض" : "I want to apply loan"));
 			opts.add(new ChatOption("contact", ar ? "التحدث إلى موظف" : "Talk to an agent",
 					ar ? "أريد التحدث إلى موظف" : "I want to talk to a human agent"));
-			return ChatReply.options(msg.toString(), withNav(opts, lang));
+
+			return ChatReply.options(msg.toString(), withNav(opts, s.lang()));
 		}
 		}
 
-		// Fallback (shouldn't happen)
-		return assistanceMenu(lang);
+		// fallback
+		return assistanceMenu(s.lang());
+	}
+
+	// --- LOAN STATUS: entry + dispatcher ---
+	private ChatReply handleLoanStatusFlow(EligibilityState state, String raw) {
+		boolean ar = "ar".equals(state.lang());
+
+		// 1) Extract + validate National ID
+		String natId = extractNationalId(raw);
+		if (natId == null || !natId.matches("\\d{10}")) {
+			String err = ar ? "الرجاء إدخال رقم هوية وطنية صالح مكوّن من 10 أرقام (مثال: 1234567890)."
+					: "Please enter a valid 10-digit National ID (e.g., 1234567890).";
+			return ChatReply.options(err, withNav(
+					List.of(new ChatOption("track_retry", ar ? "إعادة المحاولة" : "Try again", "")), state.lang()));
+		}
+
+		// 2) Mask for display safety
+		String masked = "******" + natId.substring(6);
+
+		// 3) Fetch status (mock or integrate real service)
+		LoanStatus status = fetchLoanStatusByNationalId(natId); // implement below
+
+		// 4) Build bilingual response
+		String text = null;
+		var opts = new ArrayList<ChatOption>();
+
+		switch (status) {
+		case NOT_FOUND -> {
+			text = ar ? "لم نعثر على طلب مرتبط بالهوية " + masked + ". هل ترغب ببدء طلب جديد؟"
+					: "We couldn’t find an application linked to " + masked
+							+ ". Would you like to start a new application?";
+			if (ar) {
+				opts.add(new ChatOption("elig", "تحقق من الأهلية أولاً", ""));
+				opts.add(new ChatOption("emi", "حساب القسط (EMI)", ""));
+			} else {
+				opts.add(new ChatOption("elig", "Check eligibility first", ""));
+				opts.add(new ChatOption("emi", "Calculate EMI", ""));
+			}
+		}
+		case SUBMITTED -> {
+			text = ar ? "تم استلام طلبك ويراجَع حالياً (الهوية: " + masked + ")."
+					: "Your application has been received and is under review (ID: " + masked + ").";
+			if (ar) {
+				opts.add(new ChatOption("docs", "ما المستندات المطلوبة؟", ""));
+				opts.add(new ChatOption("contact", "التحدث إلى موظف", ""));
+			} else {
+				opts.add(new ChatOption("docs", "Which documents are required?", ""));
+				opts.add(new ChatOption("contact", "Talk to an agent", ""));
+			}
+		}
+		case APPROVED -> {
+			text = ar
+					? "تهانينا! تمت الموافقة المبدئية على طلبك (الهوية: " + masked
+							+ "). الخطوة التالية: اكتمال المستندات والتوقيع."
+					: "Congrats! Your application is preliminarily approved (ID: " + masked
+							+ "). Next: documents & signing.";
+			if (ar) {
+				opts.add(new ChatOption("emi", "حساب القسط", ""));
+				opts.add(new ChatOption("docs", "المستندات المطلوبة", ""));
+			} else {
+				opts.add(new ChatOption("emi", "Calculate EMI", ""));
+				opts.add(new ChatOption("docs", "Required documents", ""));
+			}
+		}
+		case FUNDED -> {
+			text = ar
+					? "تم تمويل طلبك بنجاح (الهوية: " + masked
+							+ "). هل ترغب في تذكير بمواعيد السداد أو معرفة تفاصيل التسوية المبكرة؟"
+					: "Your loan has been funded (ID: " + masked
+							+ "). Would you like repayment reminders or early-settlement details?";
+			if (ar) {
+				opts.add(new ChatOption("remind", "تعيين تذكير للسداد", ""));
+				opts.add(new ChatOption("faq_settle", "تفاصيل السداد المبكر", ""));
+			} else {
+				opts.add(new ChatOption("remind", "Set a repayment reminder", ""));
+				opts.add(new ChatOption("faq_settle", "Early settlement details", ""));
+			}
+		}
+		case REJECTED -> {
+			text = ar ? "نأسف، تم رفض طلبك (الهوية: " + masked + "). هل ترغب بمعرفة الأسباب الشائعة وطرق التحسين؟"
+					: "Sorry, your application was rejected (ID: " + masked
+							+ "). Want to see common reasons and how to improve?";
+			if (ar) {
+				opts.add(new ChatOption("elig", "إعادة التحقق من الأهلية", ""));
+				opts.add(new ChatOption("contact", "التحدث إلى موظف", ""));
+			} else {
+				opts.add(new ChatOption("elig", "Re-check eligibility", ""));
+				opts.add(new ChatOption("contact", "Talk to an agent", ""));
+			}
+		}
+		}
+
+		return ChatReply.options(text, withNav(opts, state.lang()));
+	}
+
+	private enum LoanStatus {
+		NOT_FOUND, SUBMITTED, APPROVED, FUNDED, REJECTED
+	}
+
+	private LoanStatus fetchLoanStatusByNationalId(String natId) {
+		// TODO integrate your real core/DB. This is a deterministic mock:
+		if (natId.endsWith("0"))
+			return LoanStatus.SUBMITTED;
+		if (natId.endsWith("1"))
+			return LoanStatus.APPROVED;
+		if (natId.endsWith("2"))
+			return LoanStatus.FUNDED;
+		if (natId.endsWith("3"))
+			return LoanStatus.REJECTED;
+		return LoanStatus.NOT_FOUND;
+	}
+
+	// Extract first 10 consecutive digits that looks like a Saudi National ID
+	private String extractNationalId(String raw) {
+		if (raw == null)
+			return null;
+		// accept Arabic-Indic digits too
+		String latin = arabicDigitsToLatin(raw);
+		var m = java.util.regex.Pattern.compile("\\b\\d{10}\\b").matcher(latin);
+		return m.find() ? m.group() : null;
 	}
 
 	private ChatReply handleEmiCalc(EligibilityState state) {
@@ -520,7 +653,6 @@ public class ChatbotService {
 		if (tenure > 12)
 			options.add(
 					new ChatOption("ten_down", state.lang().equals("ar") ? "جرّب مدة أقصر" : "Try shorter tenure", ""));
-		int longer = Math.min(120, tenure + 12);
 		options.add(new ChatOption("ten_up", state.lang().equals("ar") ? "جرّب مدة أطول" : "Try longer tenure", ""));
 		options.add(new ChatOption("chg_amt", state.lang().equals("ar") ? "تغيير مبلغ القرض" : "Change amount", ""));
 
@@ -533,120 +665,131 @@ public class ChatbotService {
 		return ChatReply.options(text, withNav(options, state.lang()));
 	}
 
-	private ChatReply handleOpenAccount(EligibilityState state) {
-		String lang = state.lang();
-		String question = lang.equals("ar") ? "أي نوع من الحسابات ترغب في فتحه؟"
-				: "Which type of account would you like to open?";
-		var choices = lang.equals("ar")
-				? List.of(new ChatOption("acct_saving", "حساب توفير", ""),
-						new ChatOption("acct_current", "حساب جاري", ""), new ChatOption("acct_salary", "حساب راتب", ""))
-				: List.of(new ChatOption("acct_saving", "Savings Account", ""),
-						new ChatOption("acct_current", "Current Account", ""),
-						new ChatOption("acct_salary", "Salary Account", ""));
-		return ChatReply.options(question, withNav(choices, lang));
-	}
-
-	private ChatReply handleAccountTypeDetails(EligibilityState state, AccountType type) {
-		String lang = state.lang();
-		String query = switch (type) {
-		case SAVINGS -> lang.equals("ar") ? "المستندات المطلوبة لفتح حساب توفير"
-				: "documents required to open a savings account in KSA";
-		case CURRENT -> lang.equals("ar") ? "المستندات المطلوبة لفتح حساب جاري"
-				: "documents required to open a current account in KSA";
-		case SALARY -> lang.equals("ar") ? "المستندات المطلوبة لفتح حساب راتب"
-				: "documents required to open a salary account in KSA";
-		};
-
-		List<Document> docs;
-		try {
-			docs = documentLoader.searchByLangDiversified(query, lang, 6, 2);
-		} catch (Exception e) {
-			docs = List.of();
-		}
-		String ctx = documentLoader.joinContents(docs);
-
-		String title, bullets, note;
-		if ("ar".equals(lang)) {
-			title = switch (type) {
-			case SAVINGS -> "متطلبات فتح حساب توفير:";
-			case CURRENT -> "متطلبات فتح حساب جاري:";
-			case SALARY -> "متطلبات فتح حساب راتب:";
-			};
-			bullets = """
-					• الهوية الوطنية
-					• إثبات العنوان (إن وُجد)
-					• خطاب جهة العمل/الطالب (إذا طُلب)
-					""".strip();
-			note = "ملاحظة: قد تختلف المتطلبات حسب نوع الحساب وجهة العمل، وقد نطلب مستندات إضافية أثناء التقديم.";
-		} else {
-			title = switch (type) {
-			case SAVINGS -> "Requirements to open a Savings Account:";
-			case CURRENT -> "Requirements to open a Current Account:";
-			case SALARY -> "Requirements to open a Salary Account:";
-			};
-			bullets = """
-					• National ID
-					• Proof of Address (if applicable)
-					• Employer or Student Letter (if requested)
-					""".strip();
-			note = "Note: Requirements may vary by account type and employer; additional documents may be requested.";
-		}
-
-		String text = ("%s\n%s\n\n%s").formatted(title, bullets, note).strip();
-
-		var options = new ArrayList<ChatOption>();
-		if ("ar".equals(lang)) {
-			options.add(new ChatOption("acct_start", "ابدأ فتح الحساب", ""));
-			options.add(new ChatOption("acct_docs_more", "تفاصيل أكثر", ""));
-			options.add(new ChatOption("contact", "التحدث إلى موظف", ""));
-		} else {
-			options.add(new ChatOption("acct_start", "Start application", ""));
-			options.add(new ChatOption("acct_docs_more", "See more details", ""));
-			options.add(new ChatOption("contact", "Talk to an agent", ""));
-		}
-		return ChatReply.options(text, withNav(options, lang));
-	}
-
 	private ChatReply handleFaqRag(EligibilityState state, String raw) {
 		String lang = state.lang();
 		String q = sanitizeQuery(raw);
-		if (q.length() < 3) {
-			return ChatReply.options(
-					lang.equals("ar") ? "هل يمكنك التوضيح أكثر؟ ما الذي تريد معرفته تحديداً؟"
-							: "Could you clarify what you’d like to know?",
-					withNav(List.of(new ChatOption("docs",
-							lang.equals("ar") ? "المستندات المطلوبة" : "Required Documents", "")), lang));
-		}
 
-		List<Document> hits = List.of();
+		List<Document> hits;
 		try {
 			hits = documentLoader.searchByLangDiversified(q, lang, 6, 2);
-		} catch (Exception ignored) {
+		} catch (Exception e) {
+			hits = List.of();
 		}
 		String ctx = documentLoader.joinContents(hits);
 
-		String answer = chatClient.prompt().system(SYSTEM + (ctx.isBlank() ? "" : "\nCONTEXT:\n" + ctx)).user(raw)
-				.call().content();
+		String langDirective = "ar".equals(lang)
+				? "\nSTRICT_OUTPUT: Answer ONLY in Arabic, as plain text sentences. Do NOT return JSON, keys, or code fences."
+				: "\nSTRICT_OUTPUT: Answer ONLY in English, as plain text sentences. Do NOT return JSON, keys, or code fences.";
+
+		String answer = chatClient.prompt().system(SYSTEM + (ctx.isBlank() ? "" : "\nCONTEXT:\n" + ctx) + langDirective)
+				.user(raw).call().content();
+
+		answer = normalizeModelAnswer(answer, lang); // 👈 make it safe/plain
 
 		return ChatReply.text(answer);
 	}
 
+	private String normalizeModelAnswer(String ans, String lang) {
+		if (ans == null)
+			return "";
+		// strip code fences if any
+		ans = ans.replaceAll("(?s)```+.*?```+", "").trim();
+
+		// Try parse a top-level JSON object
+		if (ans.startsWith("{") && ans.endsWith("}")) {
+			try {
+				var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+				var node = mapper.readTree(ans);
+				// common keys we’ve seen
+				String[] keys = new String[] { "response", "answer", "text", "content", "message" };
+				for (String k : keys) {
+					if (node.has(k) && !node.get(k).isNull()) {
+						return node.get(k).asText();
+					}
+				}
+			} catch (Exception ignored) {
+			}
+		}
+		// If it’s a JSON array of strings, join as bullets
+		if (ans.startsWith("[") && ans.endsWith("]")) {
+			try {
+				var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+				var arr = mapper.readTree(ans);
+				if (arr.isArray()) {
+					String bullet = "ar".equals(lang) ? "• " : "• ";
+					StringBuilder sb = new StringBuilder();
+					for (var n : arr) {
+						if (n.isTextual()) {
+							if (sb.length() > 0)
+								sb.append("\n");
+							sb.append(bullet).append(n.asText());
+						}
+					}
+					if (sb.length() > 0)
+						return sb.toString();
+				}
+			} catch (Exception ignored) {
+			}
+		}
+		// Otherwise return as-is (already plain text)
+		return ans;
+	}
+
 	// ====== Builders ======
 	private ChatReply assistanceMenu(String lang) {
-		String out = "ar".equals(lang) ? "ar" : "en";
-		if ("ar".equals(out)) {
+		if ("ar".equals(lang)) {
 			return ChatReply.options("مرحباً! أنا مساعدك المالي. كيف أستطيع مساعدتك اليوم؟",
-					withNav(List.of(new ChatOption("elig", "التحقق من أهلية القرض", ""),
+					withNav(List.of(new ChatOption("elig", "التحقق من أهلية التمويل", ""),
 							new ChatOption("emi", "حاسبة القسط الشهري (EMI)", ""),
-							new ChatOption("acct", "فتح حساب", ""), new ChatOption("docs", "المستندات المطلوبة", ""),
+							new ChatOption("track", "متابعة الطلب", ""), // ← NEW
+							new ChatOption("docs", "الأسئلة الشائعة / المستندات", ""),
 							new ChatOption("lang_en", "English", "")), "ar"));
 		}
 		return ChatReply.options("Hey! I’m your finance assistant. How can I help you today?",
 				withNav(List.of(new ChatOption("elig", "Check Loan Eligibility", ""),
-						new ChatOption("emi", "Calculate EMI", ""), new ChatOption("acct", "Open an Account", ""),
-						new ChatOption("docs", "Required Documents", ""), new ChatOption("lang_ar", "العربية", "")),
+						new ChatOption("emi", "Calculate EMI", ""), new ChatOption("track", "Track application", ""), // ←
+																														// NEW
+						new ChatOption("docs", "FAQs / Documents", ""), new ChatOption("lang_ar", "العربية", "")),
 						"en"));
 	}
+
+//	private ChatReply handleLoanStatusLookup(String nationalId, EligibilityState state) {
+//	    String lang = state.lang();
+//	    LoanStatusResponse resp = null;
+//	    try {
+//	        resp = loanService.getStatusByNationalId(nationalId);
+//	    } catch (Exception e) {
+//	        return ChatReply.options(
+//	            "ar".equals(lang) ? "عذراً، حدث خطأ أثناء جلب حالة الطلب." : "Sorry, something went wrong fetching the status.",
+//	            withNav(List.of(
+//	                new ChatOption("contact", "ar".equals(lang) ? "التحدث إلى موظف" : "Talk to an agent", "")
+//	            ), lang)
+//	        );
+//	    }
+//
+//	    if (resp == null || resp.getStatus() == null) {
+//	        return ChatReply.options(
+//	            "ar".equals(lang) ? "لم يتم العثور على أي طلب تمويل مرتبط بهذا الرقم." : "No loan application found for this ID.",
+//	            withNav(List.of(
+//	                new ChatOption("elig", "ar".equals(lang) ? "تحقق من الأهلية" : "Check eligibility", ""),
+//	                new ChatOption("emi",  "ar".equals(lang) ? "حساب القسط (EMI)" : "Calculate EMI", "")
+//	            ), lang)
+//	        );
+//	    }
+//
+//	    String statusText = "ar".equals(lang) ? resp.toArabic() : resp.toEnglish();
+//	    String header = "ar".equals(lang) ? "حالة طلب التمويل: " : "Your loan status: ";
+//
+//	    // Keep the message minimal (no sensitive details)
+//	    String text = header + statusText;
+//
+//	    var options = new ArrayList<ChatOption>();
+//	    options.add(new ChatOption("elig", "ar".equals(lang) ? "تحقق من الأهلية" : "Check eligibility", ""));
+//	    options.add(new ChatOption("emi",  "ar".equals(lang) ? "حساب القسط (EMI)" : "Calculate EMI", ""));
+//	    options.add(new ChatOption("contact", "ar".equals(lang) ? "التحدث إلى موظف" : "Talk to an agent", ""));
+//
+//	    return ChatReply.options(text, withNav(options, lang));
+//	}
 
 	private ChatReply loanTypeMenu(String lang) {
 		if ("ar".equals(lang)) {
@@ -812,36 +955,23 @@ public class ChatbotService {
 		return s;
 	}
 
-	private String resolveAndSetLang(String userId, String raw) {
-		var st = sessions.get(userId);
-		if (containsArabic(raw)) {
-			st.setLang("ar");
-			return "ar";
-		}
-		if (looksLikeAsciiPayload(raw)) {
-			String prev = st.lang();
-			if (prev == null || prev.isBlank()) {
-				st.setLang("en");
-				return "en";
-			}
-			return prev; // keep previous language
-		}
-		st.setLang("en");
-		return "en";
-	}
-
-	private static boolean containsArabic(String s) {
-		if (s == null || s.isBlank())
-			return false;
-		return s.codePoints().anyMatch(cp -> (cp >= 0x0600 && cp <= 0x06FF) || (cp >= 0x0750 && cp <= 0x077F)
-				|| (cp >= 0x08A0 && cp <= 0x08FF) || (cp >= 0xFB50 && cp <= 0xFDFF) || (cp >= 0xFE70 && cp <= 0xFEFF));
-	}
-
-	private static boolean looksLikeAsciiPayload(String s) {
+	/** Convert Arabic-Indic digits to Latin digits (٠١٢٣٤٥٦٧٨٩ -> 0123456789) */
+	private static String normalizeToLatinDigits(String s) {
 		if (s == null)
-			return false;
-		String t = s.trim();
-		return !t.isEmpty() && t.matches("^[a-z0-9_\\-\\s]+$");
+			return "";
+		StringBuilder out = new StringBuilder(s.length());
+		for (int i = 0; i < s.length(); i++) {
+			char c = s.charAt(i);
+			if (c >= 0x0660 && c <= 0x0669) {
+				out.append((char) ('0' + (c - 0x0660)));
+			} else if (c >= 0x06F0 && c <= 0x06F9) {
+				// Eastern Arabic-Indic digits (Persian)
+				out.append((char) ('0' + (c - 0x06F0)));
+			} else {
+				out.append(c);
+			}
+		}
+		return out.toString();
 	}
 
 	private static boolean isMenuCommand(String raw) {
@@ -849,20 +979,23 @@ public class ChatbotService {
 			return false;
 		String s = raw.trim();
 		String lower = s.toLowerCase();
-		return lower.equals("menu") || s.contains("القائمة") || s.contains("القائمة الرئيسية") || s.contains("منيو");
+		return lower.equals("menu") || s.contains("القائمة") || s.contains("القائمة الرئيسية") || s.contains("منيو")
+				|| s.contains("الرئيسية");
+	}
+
+	private boolean isDocsCommand(String lower, String raw) {
+		return lower.equals("docs") || lower.contains("document") || raw.contains("المستندات")
+				|| raw.contains("الوثائق") || raw.contains("الأوراق");
 	}
 
 	private boolean isEligCommand(String lower, String raw) {
-		return lower.equals("elig") || lower.equals("eligibility") || lower.equals("elig_go") || raw.contains("أهلية");
+		return lower.equals("elig") || lower.equals("eligibility") || lower.equals("elig_go") || raw.contains("أهلية")
+				|| raw.contains("مؤهل") || raw.contains("هل أنا مؤهل");
 	}
 
 	private boolean isEmiCommand(String lower, String raw) {
 		return lower.equals("emi") || lower.startsWith("calc emi") || lower.equals("emi_go") || raw.contains("قسط")
-				|| raw.contains("حاسبة");
-	}
-
-	private boolean isDocsCommand(String lower, String raw) {
-		return lower.equals("docs") || lower.contains("document") || raw.contains("المستندات");
+				|| raw.contains("حاسبة") || raw.contains("حاسبة القسط");
 	}
 
 	private String sanitizeQuery(String s) {
@@ -876,10 +1009,8 @@ public class ChatbotService {
 		var list = new ArrayList<>(base);
 		if ("ar".equals(lang)) {
 			list.add(new ChatOption("menu", "القائمة الرئيسية", ""));
-			list.add(new ChatOption("reset", "بدء من جديد", ""));
 		} else {
 			list.add(new ChatOption("menu", "Main menu", ""));
-			list.add(new ChatOption("reset", "Start over", ""));
 		}
 		return list;
 	}
@@ -890,33 +1021,6 @@ public class ChatbotService {
 		case MORTGAGE, HOME -> 6.25;
 		case AUTO -> 5.5;
 		};
-	}
-
-	private void mergeSlots(EligibilityState s, IntentResult in) {
-		if (in == null)
-			return;
-		if (in.currency != null)
-			s.setCurrency(in.currency);
-		if (in.amount != null)
-			s.setAmount(in.amount);
-		if (in.tenureMonths != null)
-			s.setTenureMonths(in.tenureMonths);
-		if (in.annualRate != null)
-			s.setAnnualRate(in.annualRate);
-
-		if (in.monthlyIncome != null)
-			s.setMonthlyIncome(in.monthlyIncome);
-		if (in.employerType != null)
-			s.setEmployerType(in.employerType);
-		if (in.serviceMonths != null)
-			s.setServiceMonths(in.serviceMonths);
-		if (in.hasExistingLoans != null)
-			s.setHasExistingLoans(in.hasExistingLoans);
-		if (in.nationality != null)
-			s.setNationality(in.nationality);
-
-		if (in.loanType != null)
-			s.setLoanType(in.loanType);
 	}
 
 	private static boolean containsPhrase(String haystack, String needle) {
@@ -1091,4 +1195,101 @@ public class ChatbotService {
 		return out.toString();
 	}
 
+	// ===== Offer helpers (inside ChatbotService) =====
+
+	// Pick a sensible default tenure per product
+	private int defaultTenureMonths(LoanType t) {
+		return switch (t) {
+		case PERSONAL -> 48; // 4 years
+		case AUTO -> 60; // 5 years
+		case MORTGAGE, HOME -> 240; // 20 years (adjust if your bank uses 25 years → 300)
+		};
+	}
+
+	// Product caps (optional, tune to your bank’s policy)
+	private double productMaxAmount(LoanType t) {
+		return switch (t) {
+		case PERSONAL -> 50_000.0;
+		case AUTO -> 20_000.0;
+		case MORTGAGE, HOME -> 2_000_000.0;
+		};
+	}
+
+	// Invert EMI formula to compute principal P from EMI, monthly rate r, and n
+	// months
+	// EMI = P * r * (1+r)^n / ((1+r)^n - 1)
+	// => P = EMI * ((1+r)^n - 1) / (r * (1+r)^n)
+	private double principalFromEmi(double emi, double annualRatePct, int nMonths) {
+		double rMonthly = (annualRatePct / 100.0) / 12.0;
+		if (emi <= 0.0)
+			return 0.0;
+		if (rMonthly <= 0.0)
+			return emi * nMonths; // zero-rate fallback
+		double pow = Math.pow(1.0 + rMonthly, nMonths);
+		double denom = rMonthly * pow;
+		double numer = (pow - 1.0);
+		return (denom == 0.0) ? 0.0 : emi * (numer / denom);
+	}
+
+	/**
+	 * Build a personalized offer (amount + tenure + EMI) if we have enough data.
+	 */
+	private Offer buildOffer(EligibilityState s, EligibilityService.Verdict v) {
+		// We need income + obligations + loan type
+		if (s.getLoanType() == null || s.getMonthlyIncome() == null)
+			return null;
+
+		double income = Math.max(0, s.getMonthlyIncome());
+		double other = (s.getOtherObligationsMonthly() == null) ? 0.0 : Math.max(0, s.getOtherObligationsMonthly());
+
+		// If your verdict filled suggestedDtiCap, use it; otherwise pick a safe cap
+		// ~40%
+		double dtiCap = (v != null && v.suggestedDtiCap != null) ? v.suggestedDtiCap : 0.40;
+		dtiCap = Math.max(0.25, Math.min(0.50, dtiCap));
+
+		// Max *new* EMI budget (income * cap minus existing obligations)
+		double maxNewEmi = Math.max(0.0, dtiCap * income - other);
+
+		// Choose tenure and APR
+		int n = (s.getTenureMonths() != null) ? s.getTenureMonths() : defaultTenureMonths(s.getLoanType());
+		double apr = rateService.getRate(s.getLoanType(),
+				// we don't know amount yet, pass a rough guess
+				Math.max(50_000, s.getAmount() == null ? 50_000 : s.getAmount()), n, s.getEmployerType());
+		// Safety fallback if rate service returns 0/NaN
+		if (Double.isNaN(apr) || apr <= 0.0)
+			apr = fallbackRate(s.getLoanType());
+
+		// Compute principal offer from EMI budget
+		double rawAmount = principalFromEmi(maxNewEmi, apr, n);
+
+		// Clamp to product caps
+		double cap = productMaxAmount(s.getLoanType());
+		double offerAmount = Math.min(rawAmount, cap);
+
+		// Be a bit conservative (optionally haircut by ~5%)
+		offerAmount = Math.max(0.0, Math.floor(offerAmount / 1000.0) * 1000.0 * 0.95);
+
+		// Recompute EMI from final amount (so EMI aligns with rounded amount)
+		double emi = tools.emi(offerAmount, apr, n);
+
+		Offer out = new Offer();
+		out.amount = round2(offerAmount);
+		out.tenureMonths = n;
+		out.annualRate = apr;
+		out.emi = round2(emi);
+		out.currency = (s.getCurrency() != null) ? s.getCurrency() : ("ar".equals(s.lang()) ? "ريال" : "SAR");
+		return out;
+	}
+
+	private static class Offer {
+		double amount;
+		int tenureMonths;
+		double annualRate;
+		double emi;
+		String currency;
+	}
+
+	private static double round2(double v) {
+		return Math.round(v * 100.0) / 100.0;
+	}
 }

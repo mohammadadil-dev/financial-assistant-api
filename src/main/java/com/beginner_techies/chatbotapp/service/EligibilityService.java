@@ -1,154 +1,137 @@
 package com.beginner_techies.chatbotapp.service;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-
 import org.springframework.stereotype.Service;
 
 import com.beginner_techies.chatbotapp.dto.EligibilityState;
-import com.beginner_techies.chatbotapp.util.FinanceTools;
 
 @Service
 public class EligibilityService {
 
-	public enum VerdictStatus {
-		PREQUALIFIED, // meets rules comfortably
-		BORDERLINE, // close to limits; suggest adjustments
-		NEED_INFO, // missing inputs – ask before judging
-		PRELIM_INELIGIBLE // likely not eligible under current inputs (not final)
-	}
+    public static class Verdict {
+        public enum Status { NEED_INFO, PRELIM_INELIGIBLE, BORDERLINE, PREQUALIFIED }
+        public Status status;
+        public java.util.List<String> reasons = new java.util.ArrayList<>();
+        public Double dtiRatio;      // commitments / income
+        public Double maxAllowedEmi; // 40–45% rule of income (after any penalties)
+        public Double suggestedDtiCap; // the cap actually used
+    }
 
-	public static final class EligibilityVerdict {
-		public final VerdictStatus status;
-		public final List<String> reasons; // human-readable, localized by caller
-		public final Double appliedAnnualRate; // % APR used for any EMI math
-		public final Double estimatedEmi; // if amount+tenure present
-		public final Double dtiRatio; // 0..1 if computable (incl. other obligations)
-		public final Double maxAllowedEmi; // income*DTI cap if computable
+    /** Main rule engine using your existing fields only. */
+    public Verdict evaluateDetailed(EligibilityState s) {
+        Verdict v = new Verdict();
 
-		public EligibilityVerdict(VerdictStatus status, List<String> reasons, Double appliedAnnualRate,
-				Double estimatedEmi, Double dtiRatio, Double maxAllowedEmi) {
-			this.status = status;
-			this.reasons = reasons;
-			this.appliedAnnualRate = appliedAnnualRate;
-			this.estimatedEmi = estimatedEmi;
-			this.dtiRatio = dtiRatio;
-			this.maxAllowedEmi = maxAllowedEmi;
-		}
-	}
+        // ---- Required core slots
+        if (s.getMonthlyIncome() == null) v.reasons.add("NEED_INCOME");
+        if (s.getEmployerType() == null || s.getEmployerType().isBlank()) v.reasons.add("NEED_EMPLOYER_TYPE");
+        if (s.getServiceMonths() == null) v.reasons.add("NEED_SERVICE_MONTHS");
 
-	// Policy knobs (tune per product / employer type)
-	private static final Map<String, Integer> MIN_SERVICE_MONTHS = Map.of("government", 3, "private", 6, "contract", 12,
-			"self-employed", 12);
+        if (!v.reasons.isEmpty()) {
+            v.status = Verdict.Status.NEED_INFO;
+            return v;
+        }
 
-	private static final Map<String, Double> MIN_INCOME = Map.of("government", 8000.0, "private", 10000.0, "contract",
-			12000.0, "self-employed", 15000.0);
+        // ---- Normalize inputs
+        double income = Math.max(0, s.getMonthlyIncome());
+        String emp = normalizeEmployerType(s.getEmployerType());
+        int svc = Math.max(0, s.getServiceMonths());
+        boolean hasLoans = s.getHasExistingLoans() != null && s.getHasExistingLoans();
+        double other = s.getOtherObligationsMonthly() == null ? 0.0 : Math.max(0, s.getOtherObligationsMonthly());
+        boolean isSaudi = isSaudi(s.getNationality());
 
-	private static final double MAX_DTI = 0.40; // 40% of income
-	private static final double HARD_DTI = 0.50; // beyond this → prelim ineligible
+        // ---- Policy thresholds (adjust to your bank)
+        double minIncome;
+        int minService;
+        // base DTI cap (commitments/income); we then apply penalties
+        double baseDtiCap = switch (emp) {
+            case "government" -> 0.45;
+            case "private"    -> 0.40;
+            case "contract",
+                 "self-employed" -> 0.35;
+            default           -> 0.40;
+        };
+        // Nationality tightening
+        if (!isSaudi) baseDtiCap -= 0.05; // e.g., 40% → 35%
 
-	private final RateService rateService;
-	private final FinanceTools tools; // for EMI
+        // Income & service thresholds by employer + nationality
+        if (emp.equals("government")) {
+            minIncome = isSaudi ? 4000 : 6000;
+            minService = 6;
+        } else if (emp.equals("private")) {
+            minIncome = isSaudi ? 5000 : 7000;
+            minService = 12;
+        } else if (emp.equals("contract")) {
+            minIncome = isSaudi ? 7000 : 9000;
+            minService = 18;
+        } else { // self-employed or unknown
+            minIncome = isSaudi ? 7000 : 9000;
+            minService = 24;
+        }
 
-	public EligibilityService(RateService rateService, FinanceTools tools) {
-		this.rateService = rateService;
-		this.tools = tools;
-	}
+        // Existing loans penalty on DTI cap (tighter)
+        double dtiCap = baseDtiCap - (hasLoans ? 0.05 : 0.0);
+        dtiCap = clamp(dtiCap, 0.25, 0.50); // safety bounds
 
-	/**
-	 * Deterministic evaluation. No LLM here. - Doesn’t “decline” when information
-	 * is missing → returns NEED_INFO + what to ask. - Uses policy thresholds by
-	 * employer type. - If amount & tenure present, computes EMI and DTI.
-	 */
-	public EligibilityVerdict evaluateDetailed(EligibilityState s) {
-		List<String> reasons = new ArrayList<>();
+        // ---- Deterministic checks
+        if (income < minIncome) v.reasons.add("LOW_INCOME");
+        if (svc < minService) v.reasons.add("LOW_SERVICE_MONTHS");
 
-		// 0) Require the basic triad for any meaningful decision
-		if (s.getMonthlyIncome() == null || s.getEmployerType() == null || s.getServiceMonths() == null) {
-			if (s.getMonthlyIncome() == null)
-				reasons.add("NEED_INCOME");
-			if (s.getEmployerType() == null)
-				reasons.add("NEED_EMPLOYER_TYPE");
-			if (s.getServiceMonths() == null)
-				reasons.add("NEED_SERVICE_MONTHS");
-			return new EligibilityVerdict(VerdictStatus.NEED_INFO, reasons, null, null, null, null);
-		}
+        double dti = (income <= 0) ? 1.0 : (other / income);
+        v.dtiRatio = round2(dti * 100.0) / 100.0; // keep as fraction internally; round display outside
+        v.suggestedDtiCap = dtiCap;
 
-		String emp = normalizeEmployer(s.getEmployerType());
-		int minSvc = MIN_SERVICE_MONTHS.getOrDefault(emp, 6);
-		double minIncome = MIN_INCOME.getOrDefault(emp, 10000.0);
+        if (dti > dtiCap) v.reasons.add("DTI_ABOVE_CAP");
 
-		// 1) Base policy checks
-		if (s.getServiceMonths() < minSvc) {
-			reasons.add("LOW_SERVICE_MONTHS");
-		}
-		if (s.getMonthlyIncome() < minIncome) {
-			reasons.add("LOW_INCOME");
-		}
+        // ---- Verdict logic
+        if (!v.reasons.isEmpty()) {
+            // If only one reason and close to the threshold → borderline
+            if (v.reasons.size() == 1 && (
+                    nearPct(income, minIncome, 0.08) ||
+                    nearInt(svc, minService, 2) ||
+                    nearPct(dti, dtiCap, 0.08)
+            )) {
+                v.status = Verdict.Status.BORDERLINE;
+            } else {
+                v.status = Verdict.Status.PRELIM_INELIGIBLE;
+            }
+        } else {
+            v.status = Verdict.Status.PREQUALIFIED;
+        }
 
-		// If any base policy fails -> prelim ineligible, but keep friendly tone in UI
-		if (!reasons.isEmpty() && (s.getAmount() == null || s.getTenureMonths() == null)) {
-			return new EligibilityVerdict(VerdictStatus.PRELIM_INELIGIBLE, reasons, null, null, null, null);
-		}
+        // Max affordable EMI (guideline) = dtiCap * income  (if you want to show it)
+        v.maxAllowedEmi = round2(dtiCap * income);
+        return v;
+    }
 
-		// 2) If amount & tenure provided, compute EMI and DTI
-		Double rate = null, emi = null, dti = null, maxEmi = null;
-		if (s.getAmount() != null && s.getTenureMonths() != null && s.getLoanType() != null) {
-			rate = rateService.getRate(s.getLoanType(), s.getAmount(), s.getTenureMonths(), emp);
-			if (rate == null || rate <= 0) {
-				// fallback: still compute zero-rate EMI to give a sense of affordability band
-				rate = 0.0;
-			}
-			emi = tools.emi(s.getAmount(), rate, s.getTenureMonths()); // handles r=0 internally
-			double other = safeDouble(s.getOtherObligationsMonthly()); // optional field; 0 if null
-			maxEmi = s.getMonthlyIncome() * MAX_DTI;
-			dti = (emi + other) / s.getMonthlyIncome();
+    // ---------- helpers ----------
+    private static String normalizeEmployerType(String raw) {
+        if (raw == null) return "private";
+        String r = raw.trim().toLowerCase();
+        if (r.contains("gov") || r.contains("حكوم")) return "government";
+        if (r.contains("priv") || r.contains("خاص")) return "private";
+        if (r.contains("contract") || r.contains("متعاقد")) return "contract";
+        if (r.contains("self") || r.contains("حر")) return "self-employed";
+        return r; // already normalized?
+    }
 
-			if (dti > HARD_DTI)
-				reasons.add("DTI_ABOVE_50");
-			else if (dti > MAX_DTI)
-				reasons.add("DTI_ABOVE_40");
-		}
+    private static boolean isSaudi(String nationality) {
+        if (nationality == null) return true; // default neutral
+        String n = nationality.trim().toLowerCase();
+        return n.contains("saudi") || n.contains("سعود");
+    }
 
-		// 3) Decide status
-		VerdictStatus status;
-		if (reasons.contains("LOW_SERVICE_MONTHS") || reasons.contains("LOW_INCOME")
-				|| reasons.contains("DTI_ABOVE_50")) {
-			status = VerdictStatus.PRELIM_INELIGIBLE;
-		} else if (reasons.contains("DTI_ABOVE_40")) {
-			status = VerdictStatus.BORDERLINE;
-		} else if (s.getAmount() != null && s.getTenureMonths() != null) {
-			status = VerdictStatus.PREQUALIFIED; // meets base and affordability rule
-		} else {
-			status = VerdictStatus.PREQUALIFIED; // base checks pass; offer next steps (EMI, docs)
-		}
+    private static double clamp(double x, double lo, double hi) {
+        return Math.max(lo, Math.min(hi, x));
+    }
 
-		return new EligibilityVerdict(status, reasons, rate, emi, dti, maxEmi);
-	}
+    private static boolean nearPct(double x, double target, double tol) {
+        if (target == 0) return Math.abs(x) <= tol;
+        return Math.abs(x - target) / Math.abs(target) <= tol;
+    }
+    private static boolean nearInt(int x, int target, int tol) {
+        return Math.abs(x - target) <= tol;
+    }
 
-	private static String normalizeEmployer(String e) {
-		if (e == null)
-			return "private";
-		String x = e.toLowerCase();
-		if (x.contains("gov"))
-			return "government";
-		if (x.contains("contract"))
-			return "contract";
-		if (x.contains("self"))
-			return "self-employed";
-		if (x.contains("خاص"))
-			return "private";
-		if (x.contains("حك"))
-			return "government";
-		if (x.contains("متعاقد"))
-			return "contract";
-		if (x.contains("عمل حر"))
-			return "self-employed";
-		return "private";
-	}
-
-	private static double safeDouble(Double v) {
-		return v == null ? 0.0 : v;
-	}
+    private static double round2(double v) {
+        return Math.round(v * 100.0) / 100.0;
+    }
 }
