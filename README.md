@@ -11,7 +11,7 @@ It combines Large Language Models, Vector Search, and Retrieval-Augmented Genera
 ## Features
 
 * Spring AI Integration
-* OpenAI Integration
+* Ollama Integration
 * RAG Implementation
 * Vector Search
 * Financial Knowledge Base
@@ -34,15 +34,15 @@ API
 --> SpringAI[Spring AI]
 
 SpringAI
---> OpenAI
+--> Ollama
 
 SpringAI
---> VectorDB
+--> Pinecone
 
-VectorDB
+Pinecone
 --> FinancialDocuments
 
-OpenAI
+Ollama
 --> Response
 
 Response
@@ -56,13 +56,13 @@ sequenceDiagram
 
 User->>API: Ask Question
 
-API->>VectorDB: Search Context
+API->>Pinecone: Search Context
 
-VectorDB-->>API: Relevant Documents
+Pinecone-->>API: Relevant Documents
 
-API->>OpenAI: Prompt + Context
+API->>Ollama: Prompt + Context
 
-OpenAI-->>API: Response
+Ollama-->>API: Response
 
 API-->>User: Final Response
 ```
@@ -72,10 +72,9 @@ API-->>User: Final Response
 * Java
 * Spring Boot
 * Spring AI
-* OpenAI
+* Ollama
 * PostgreSQL
-* Vector Database
-* Redis
+* Pinecone
 * Docker
 
 ## Project Structure
@@ -109,7 +108,6 @@ financial-assistant-ui
 ## Future Enhancements
 
 * Multi-Agent Architecture
-* Arabic Language Support
 * Voice Assistant
 * Customer Personalization
 * Real-Time Streaming
