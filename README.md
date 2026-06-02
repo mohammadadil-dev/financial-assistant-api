@@ -1,159 +1,119 @@
-# Financial AI Assistant
+# Financial Assistant API
 
-An AI-powered financial chatbot built using Spring AI, OpenAI, Retrieval-Augmented Generation (RAG), and Vector Database technology to deliver accurate and context-aware financial assistance.
+AI-powered backend platform for financial assistance built using Spring Boot, Spring AI, OpenAI, and Retrieval-Augmented Generation (RAG).
 
 ## Overview
 
-Financial AI Assistant is designed to provide intelligent financial guidance by combining Large Language Models (LLMs) with enterprise knowledge retrieval.
+Financial Assistant API is the intelligence layer behind the Financial Assistant platform.
 
-The platform uses Retrieval-Augmented Generation (RAG) to deliver responses grounded in financial documents, policies, product information, and business knowledge.
+It combines Large Language Models, Vector Search, and Retrieval-Augmented Generation (RAG) to provide accurate and context-aware financial responses.
 
-## Key Features
+## Features
 
-* AI-powered conversational interface
-* OpenAI integration
-* Spring AI implementation
-* Retrieval-Augmented Generation (RAG)
-* Context-aware responses
-* Financial knowledge search
-* Document-based question answering
-* Conversation memory
-* Scalable microservice architecture
+* Spring AI Integration
+* OpenAI Integration
+* RAG Implementation
+* Vector Search
+* Financial Knowledge Base
+* Context-Aware Responses
+* REST APIs
+* Scalable Microservice Design
 
 ## Architecture
 
 ```mermaid
 flowchart TD
 
-    User[Customer]
+Customer
+--> UI[Financial Assistant UI]
 
-    User --> UI[Chat Interface]
+UI
+--> API[Financial Assistant API]
 
-    UI --> API[Spring Boot API]
+API
+--> SpringAI[Spring AI]
 
-    API --> AI[Spring AI]
+SpringAI
+--> OpenAI
 
-    AI --> VDB[Vector Database]
+SpringAI
+--> VectorDB
 
-    AI --> OPENAI[OpenAI Model]
+VectorDB
+--> FinancialDocuments
 
-    VDB --> DOCS[Financial Documents]
+OpenAI
+--> Response
 
-    OPENAI --> RESPONSE[Generated Response]
-
-    RESPONSE --> User
+Response
+--> Customer
 ```
 
-## Solution Components
-
-| Component       | Responsibility       |
-| --------------- | -------------------- |
-| Chat UI         | Customer interaction |
-| Spring Boot API | Backend services     |
-| Spring AI       | LLM orchestration    |
-| OpenAI          | Language model       |
-| Vector Database | Semantic search      |
-| RAG Engine      | Context retrieval    |
-| Knowledge Base  | Financial documents  |
-
-## RAG Workflow
+## RAG Flow
 
 ```mermaid
 sequenceDiagram
 
-User->>Chatbot: Ask Question
+User->>API: Ask Question
 
-Chatbot->>Vector DB: Search Relevant Documents
+API->>VectorDB: Search Context
 
-Vector DB-->>Chatbot: Matching Context
+VectorDB-->>API: Relevant Documents
 
-Chatbot->>OpenAI: Prompt + Context
+API->>OpenAI: Prompt + Context
 
-OpenAI-->>Chatbot: AI Response
+OpenAI-->>API: Response
 
-Chatbot-->>User: Final Answer
+API-->>User: Final Response
 ```
 
 ## Technology Stack
 
-| Layer         | Technology           |
-| ------------- | -------------------- |
-| Backend       | Spring Boot          |
-| AI Framework  | Spring AI            |
-| LLM           | OpenAI               |
-| Vector Search | Pinecone / Vector DB |
-| Database      | PostgreSQL           |
-| Cache         | Redis                |
-| Deployment    | Docker               |
-| Monitoring    | ELK                  |
+* Java
+* Spring Boot
+* Spring AI
+* OpenAI
+* PostgreSQL
+* Vector Database
+* Redis
+* Docker
 
-## Sample Use Cases
-
-### Loan Eligibility Queries
+## Project Structure
 
 ```text
-Am I eligible for a personal loan?
+src
+├── controller
+├── service
+├── config
+├── ai
+├── rag
+├── repository
+└── model
 ```
 
-### EMI Calculation Guidance
+## Use Cases
 
-```text
-How much would my monthly installment be?
-```
+* Loan Eligibility Assistant
+* Financial Product Guidance
+* Customer Support Automation
+* Contract Information Retrieval
+* EMI Guidance
+* Knowledge Search
 
-### Product Information
+## Related Projects
 
-```text
-What documents are required for a salary-backed loan?
-```
+### Frontend UI
 
-### Contract Questions
-
-```text
-What is the repayment schedule?
-```
-
-## Chat Flow
-
-```mermaid
-flowchart LR
-
-A[Customer Question]
---> B[Retrieve Context]
-
-B --> C[Vector Search]
-
-C --> D[Generate Prompt]
-
-D --> E[OpenAI]
-
-E --> F[Financial Response]
-```
-
-## Security Considerations
-
-* Secure API authentication
-* Prompt validation
-* Input sanitization
-* Role-based access control
-* Audit logging
+financial-assistant-ui
 
 ## Future Enhancements
 
-* Multi-language Support (Arabic & English)
-* Voice Assistant Integration
-* AI Agents
-* Loan Recommendation Engine
+* Multi-Agent Architecture
+* Arabic Language Support
+* Voice Assistant
 * Customer Personalization
-* Real-Time Financial Insights
-
-## Business Benefits
-
-* Reduced support workload
-* Faster customer response times
-* Improved customer engagement
-* Consistent financial guidance
-* Knowledge-driven responses
+* Real-Time Streaming
+* AI Recommendation Engine
 
 ## Author
 
