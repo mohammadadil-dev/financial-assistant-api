@@ -1,147 +1,164 @@
-# Financial Chatbot
+# Financial AI Assistant
+
+An AI-powered financial chatbot built using Spring AI, OpenAI, Retrieval-Augmented Generation (RAG), and Vector Database technology to deliver accurate and context-aware financial assistance.
 
 ## Overview
-Financial Chatbot is a Spring Boot application built using Spring AI, Ollama, and Pinecone.  
-It uses Retrieval-Augmented Generation (RAG) to provide context-aware responses for financial queries.
 
-The chatbot supports both FAQ-based responses and structured financial flows like loan eligibility and EMI calculation.
+Financial AI Assistant is designed to provide intelligent financial guidance by combining Large Language Models (LLMs) with enterprise knowledge retrieval.
 
----
+The platform uses Retrieval-Augmented Generation (RAG) to deliver responses grounded in financial documents, policies, product information, and business knowledge.
 
-## Tech Stack
+## Key Features
 
-- Java 21  
-- Spring Boot 3.5.3  
-- Spring AI  
-- Ollama (LLM - llama3)  
-- Pinecone (Vector Database)  
-- Gradle  
+* AI-powered conversational interface
+* OpenAI integration
+* Spring AI implementation
+* Retrieval-Augmented Generation (RAG)
+* Context-aware responses
+* Financial knowledge search
+* Document-based question answering
+* Conversation memory
+* Scalable microservice architecture
 
----
+## Architecture
 
-## Features
+```mermaid
+flowchart TD
 
-- Chat API for financial queries
-   
-- RAG-based response generation
-    
-- English and Arabic language support
-    
-- Loan eligibility flow
-    
-- EMI calculation
-    
-- Loan status tracking using National ID
-    
-- Quick reply options support
-    
-- Knowledge base integration from local resources  
+    User[Customer]
 
----
+    User --> UI[Chat Interface]
 
-## Project Structure
-src/main/java/com/beginner_techies/chatbotapp
+    UI --> API[Spring Boot API]
 
-├── config
-├── controller
-├── dto
-├── enums
-├── record
-├── service
-├── util
-└── ChatbotappApplication.java
+    API --> AI[Spring AI]
 
-src/main/resources
-├── application.properties
-└── knowledge
+    AI --> VDB[Vector Database]
 
----
+    AI --> OPENAI[OpenAI Model]
 
-## Configuration
+    VDB --> DOCS[Financial Documents]
 
-### Environment Variables
+    OPENAI --> RESPONSE[Generated Response]
 
-PINECONE_API=your-pinecone-api-key
+    RESPONSE --> User
+```
 
-INDEX_NAME=your-index-name
+## Solution Components
 
+| Component       | Responsibility       |
+| --------------- | -------------------- |
+| Chat UI         | Customer interaction |
+| Spring Boot API | Backend services     |
+| Spring AI       | LLM orchestration    |
+| OpenAI          | Language model       |
+| Vector Database | Semantic search      |
+| RAG Engine      | Context retrieval    |
+| Knowledge Base  | Financial documents  |
 
-### application.properties
-spring.application.name=chatbotapp
+## RAG Workflow
 
-spring.ai.vectorstore.pinecone.apiKey=${PINECONE_API}
+```mermaid
+sequenceDiagram
 
-spring.ai.vectorstore.pinecone.index-name=${INDEX_NAME}
+User->>Chatbot: Ask Question
 
-spring.ai.ollama.base-url=http://localhost:11434
+Chatbot->>Vector DB: Search Relevant Documents
 
-spring.ai.ollama.model=llama3
+Vector DB-->>Chatbot: Matching Context
 
-spring.ai.ollama.init.embedding.additional-models=nomic-embed-text
+Chatbot->>OpenAI: Prompt + Context
 
+OpenAI-->>Chatbot: AI Response
 
----
+Chatbot-->>User: Final Answer
+```
 
-## Setup
+## Technology Stack
 
-### 1. Start Ollama
-ollama serve
+| Layer         | Technology           |
+| ------------- | -------------------- |
+| Backend       | Spring Boot          |
+| AI Framework  | Spring AI            |
+| LLM           | OpenAI               |
+| Vector Search | Pinecone / Vector DB |
+| Database      | PostgreSQL           |
+| Cache         | Redis                |
+| Deployment    | Docker               |
+| Monitoring    | ELK                  |
 
+## Sample Use Cases
 
-### 2. Pull Models
-ollama pull llama3
-ollama pull nomic-embed-text
+### Loan Eligibility Queries
 
-### 3. Run Application
+```text
+Am I eligible for a personal loan?
+```
 
+### EMI Calculation Guidance
 
-./gradlew bootRun
+```text
+How much would my monthly installment be?
+```
 
+### Product Information
 
----
+```text
+What documents are required for a salary-backed loan?
+```
 
-## API
+### Contract Questions
 
-### POST /api/chat
+```text
+What is the repayment schedule?
+```
 
-#### Request (English)
-{
-"content": "I want to check loan eligibility",
-"sender": "user1",
-"lang": "en"
-}
+## Chat Flow
 
-#### Request (Arabic)
-{
-"content": "أريد التحقق من الأهلية",
-"sender": "user1",
-"lang": "ar"
-}
+```mermaid
+flowchart LR
 
-#### Response
-{
-"message": "Chatbot response",
-"options": []
-}
+A[Customer Question]
+--> B[Retrieve Context]
 
+B --> C[Vector Search]
 
----
+C --> D[Generate Prompt]
 
-## Flow
+D --> E[OpenAI]
 
-1. User sends request to `/api/chat`  
-2. Application processes language and intent  
-3. For general queries → RAG flow is triggered  
-4. Relevant data is fetched from Pinecone  
-5. Context + query is sent to Ollama  
-6. Response is returned to the user  
+E --> F[Financial Response]
+```
 
----
+## Security Considerations
 
-## Build
-./gradlew build
+* Secure API authentication
+* Prompt validation
+* Input sanitization
+* Role-based access control
+* Audit logging
 
----
+## Future Enhancements
 
-## Test
-./gradlew test
+* Multi-language Support (Arabic & English)
+* Voice Assistant Integration
+* AI Agents
+* Loan Recommendation Engine
+* Customer Personalization
+* Real-Time Financial Insights
+
+## Business Benefits
+
+* Reduced support workload
+* Faster customer response times
+* Improved customer engagement
+* Consistent financial guidance
+* Knowledge-driven responses
+
+## Author
+
+Mohammad Adil
+
+🏦 FinTech Backend Lead
+☕ Java Architect
+🤖 AI Engineer
