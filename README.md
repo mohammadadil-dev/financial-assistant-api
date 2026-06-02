@@ -21,13 +21,20 @@ The chatbot supports both FAQ-based responses and structured financial flows lik
 
 ## Features
 
-- Chat API for financial queries  
-- RAG-based response generation  
-- English and Arabic language support  
-- Loan eligibility flow  
-- EMI calculation  
-- Loan status tracking using National ID  
-- Quick reply options support  
+- Chat API for financial queries
+   
+- RAG-based response generation
+    
+- English and Arabic language support
+    
+- Loan eligibility flow
+    
+- EMI calculation
+    
+- Loan status tracking using National ID
+    
+- Quick reply options support
+    
 - Knowledge base integration from local resources  
 
 ---
@@ -55,15 +62,21 @@ src/main/resources
 ### Environment Variables
 
 PINECONE_API=your-pinecone-api-key
+
 INDEX_NAME=your-index-name
 
 
 ### application.properties
 spring.application.name=chatbotapp
+
 spring.ai.vectorstore.pinecone.apiKey=${PINECONE_API}
+
 spring.ai.vectorstore.pinecone.index-name=${INDEX_NAME}
+
 spring.ai.ollama.base-url=http://localhost:11434
+
 spring.ai.ollama.model=llama3
+
 spring.ai.ollama.init.embedding.additional-models=nomic-embed-text
 
 
