@@ -10,8 +10,10 @@ import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.stereotype.Component;
 
 import jakarta.annotation.PostConstruct;
+import lombok.extern.slf4j.Slf4j;
 
 @Component
+@Slf4j
 public class DocumentLoader {
 
 	private final VectorStore vectorStore;
@@ -33,7 +35,7 @@ public class DocumentLoader {
 			vectorStore.add(docs);
 		} catch (Exception e) {
 			// don't crash the app if Pinecone is down; RAG will just be empty
-			org.slf4j.LoggerFactory.getLogger(DocumentLoader.class).warn("RAG seed failed", e);
+			log.error("RAG seed failed : {} ", e.getMessage(), e);
 		}
 	}
 
