@@ -11,6 +11,7 @@ import org.springframework.stereotype.Service;
 import com.beginner_techies.chatbotapp.config.DocumentLoader;
 import com.beginner_techies.chatbotapp.dto.EligibilityState;
 import com.beginner_techies.chatbotapp.dto.IntentResult;
+import com.beginner_techies.chatbotapp.dto.LoanStatusResponse;
 import com.beginner_techies.chatbotapp.enums.LoanAppStatus;
 import com.beginner_techies.chatbotapp.enums.LoanType;
 import com.beginner_techies.chatbotapp.record.ChatOption;
@@ -28,7 +29,7 @@ public class ChatbotService {
 	private final FinanceTools tools;
 	private final RateService rateService;
 	private final DocumentLoader documentLoader;
-	private final LoanService loanService; // <-- NEW
+	private final LoanService loanService;
 
 	private static final String SYSTEM = """
 			You are a bilingual (Arabic + English) finance assistant for customers in the KSA.
@@ -497,15 +498,27 @@ public class ChatbotService {
 		// 2) Mask for display safety
 		String masked = "******" + natId.substring(6);
 
-		// 3) Fetch status (mock or integrate real service)
-		LoanStatus status = fetchLoanStatusByNationalId(natId); // implement below
+		// 3) Fetch status via the loan service (mock impl for now; swap for the real
+		// core/DB integration later)
+		LoanStatusResponse resp;
+		try {
+			resp = loanService.getStatusByNationalId(natId);
+		} catch (Exception e) {
+			String err = ar ? "عذراً، حدث خطأ أثناء جلب حالة الطلب." : "Sorry, something went wrong fetching the status.";
+			return ChatReply.options(err, withNav(
+					List.of(new ChatOption("contact", ar ? "التحدث إلى موظف" : "Talk to an agent", "")), state.lang()));
+		}
+
+		LoanStatusResponse.Status status = (resp == null || resp.getStatus() == null)
+				? LoanStatusResponse.Status.UNKNOWN
+				: resp.getStatus();
 
 		// 4) Build bilingual response
 		String text = null;
 		var opts = new ArrayList<ChatOption>();
 
 		switch (status) {
-		case NOT_FOUND -> {
+		case UNKNOWN -> {
 			text = ar ? "لم نعثر على طلب مرتبط بالهوية " + masked + ". هل ترغب ببدء طلب جديد؟"
 					: "We couldn’t find an application linked to " + masked
 							+ ". Would you like to start a new application?";
@@ -520,6 +533,17 @@ public class ChatbotService {
 		case SUBMITTED -> {
 			text = ar ? "تم استلام طلبك ويراجَع حالياً (الهوية: " + masked + ")."
 					: "Your application has been received and is under review (ID: " + masked + ").";
+			if (ar) {
+				opts.add(new ChatOption("docs", "ما المستندات المطلوبة؟", ""));
+				opts.add(new ChatOption("contact", "التحدث إلى موظف", ""));
+			} else {
+				opts.add(new ChatOption("docs", "Which documents are required?", ""));
+				opts.add(new ChatOption("contact", "Talk to an agent", ""));
+			}
+		}
+		case UNDER_REVIEW -> {
+			text = ar ? "طلبك قيد المراجعة حالياً (الهوية: " + masked + ")."
+					: "Your application is currently under review (ID: " + masked + ").";
 			if (ar) {
 				opts.add(new ChatOption("docs", "ما المستندات المطلوبة؟", ""));
 				opts.add(new ChatOption("contact", "التحدث إلى موظف", ""));
@@ -557,9 +581,13 @@ public class ChatbotService {
 			}
 		}
 		case REJECTED -> {
-			text = ar ? "نأسف، تم رفض طلبك (الهوية: " + masked + "). هل ترغب بمعرفة الأسباب الشائعة وطرق التحسين؟"
-					: "Sorry, your application was rejected (ID: " + masked
-							+ "). Want to see common reasons and how to improve?";
+			String reason = resp == null ? null : resp.getReason();
+			boolean hasReason = reason != null && !reason.isBlank();
+			text = ar
+					? "نأسف، تم رفض طلبك (الهوية: " + masked + ")"
+							+ (hasReason ? " — " + resp.toArabic() : "") + ". هل ترغب بمعرفة طرق التحسين؟"
+					: "Sorry, your application was rejected (ID: " + masked + ")"
+							+ (hasReason ? " — " + resp.toEnglish() : "") + ". Want to see how to improve?";
 			if (ar) {
 				opts.add(new ChatOption("elig", "إعادة التحقق من الأهلية", ""));
 				opts.add(new ChatOption("contact", "التحدث إلى موظف", ""));
@@ -571,23 +599,6 @@ public class ChatbotService {
 		}
 
 		return ChatReply.options(text, withNav(opts, state.lang()));
-	}
-
-	private enum LoanStatus {
-		NOT_FOUND, SUBMITTED, APPROVED, FUNDED, REJECTED
-	}
-
-	private LoanStatus fetchLoanStatusByNationalId(String natId) {
-		// TODO integrate your real core/DB. This is a deterministic mock:
-		if (natId.endsWith("0"))
-			return LoanStatus.SUBMITTED;
-		if (natId.endsWith("1"))
-			return LoanStatus.APPROVED;
-		if (natId.endsWith("2"))
-			return LoanStatus.FUNDED;
-		if (natId.endsWith("3"))
-			return LoanStatus.REJECTED;
-		return LoanStatus.NOT_FOUND;
 	}
 
 	// Extract first 10 consecutive digits that looks like a Saudi National ID
@@ -752,44 +763,6 @@ public class ChatbotService {
 						new ChatOption("docs", "FAQs / Documents", ""), new ChatOption("lang_ar", "العربية", "")),
 						"en"));
 	}
-
-//	private ChatReply handleLoanStatusLookup(String nationalId, EligibilityState state) {
-//	    String lang = state.lang();
-//	    LoanStatusResponse resp = null;
-//	    try {
-//	        resp = loanService.getStatusByNationalId(nationalId);
-//	    } catch (Exception e) {
-//	        return ChatReply.options(
-//	            "ar".equals(lang) ? "عذراً، حدث خطأ أثناء جلب حالة الطلب." : "Sorry, something went wrong fetching the status.",
-//	            withNav(List.of(
-//	                new ChatOption("contact", "ar".equals(lang) ? "التحدث إلى موظف" : "Talk to an agent", "")
-//	            ), lang)
-//	        );
-//	    }
-//
-//	    if (resp == null || resp.getStatus() == null) {
-//	        return ChatReply.options(
-//	            "ar".equals(lang) ? "لم يتم العثور على أي طلب تمويل مرتبط بهذا الرقم." : "No loan application found for this ID.",
-//	            withNav(List.of(
-//	                new ChatOption("elig", "ar".equals(lang) ? "تحقق من الأهلية" : "Check eligibility", ""),
-//	                new ChatOption("emi",  "ar".equals(lang) ? "حساب القسط (EMI)" : "Calculate EMI", "")
-//	            ), lang)
-//	        );
-//	    }
-//
-//	    String statusText = "ar".equals(lang) ? resp.toArabic() : resp.toEnglish();
-//	    String header = "ar".equals(lang) ? "حالة طلب التمويل: " : "Your loan status: ";
-//
-//	    // Keep the message minimal (no sensitive details)
-//	    String text = header + statusText;
-//
-//	    var options = new ArrayList<ChatOption>();
-//	    options.add(new ChatOption("elig", "ar".equals(lang) ? "تحقق من الأهلية" : "Check eligibility", ""));
-//	    options.add(new ChatOption("emi",  "ar".equals(lang) ? "حساب القسط (EMI)" : "Calculate EMI", ""));
-//	    options.add(new ChatOption("contact", "ar".equals(lang) ? "التحدث إلى موظف" : "Talk to an agent", ""));
-//
-//	    return ChatReply.options(text, withNav(options, lang));
-//	}
 
 	private ChatReply loanTypeMenu(String lang) {
 		if ("ar".equals(lang)) {
