@@ -4,6 +4,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
+import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.stereotype.Service;
@@ -30,6 +32,7 @@ public class ChatbotService {
 	private final RateService rateService;
 	private final DocumentLoader documentLoader;
 	private final LoanService loanService;
+	private final ChatMemory chatMemory;
 
 	private static final String SYSTEM = """
 			You are a bilingual (Arabic + English) finance assistant for customers in the KSA.
@@ -42,7 +45,7 @@ public class ChatbotService {
 
 	public ChatbotService(ChatClient chatClient, VectorStore vectorStore, IntentDetectorService router,
 			EligibilitySessionStore sessions, EligibilityService eligibility, FinanceTools tools,
-			RateService rateService, DocumentLoader documentLoader, LoanService loanService) {
+			RateService rateService, DocumentLoader documentLoader, LoanService loanService, ChatMemory chatMemory) {
 		this.chatClient = chatClient;
 		this.vectorStore = vectorStore;
 		this.router = router;
@@ -52,6 +55,7 @@ public class ChatbotService {
 		this.rateService = rateService;
 		this.documentLoader = documentLoader;
 		this.loanService = loanService;
+		this.chatMemory = chatMemory;
 	}
 
 	// ====== Public entrypoint ======
@@ -222,7 +226,7 @@ public class ChatbotService {
 			case AUTO ->
 				lang.equals("ar") ? "المستندات المطلوبة لتمويل سيارة" : "required documents for auto/car loan in KSA";
 			};
-			return handleFaqRag(state, seed);
+			return handleFaqRag(state, seed, userId);
 		}
 
 		// ---------------- keep/enter eligibility flow if needed ----------------
@@ -310,7 +314,7 @@ public class ChatbotService {
 			yield handleEmiCalc(state);
 		}
 		case FAQ_RAG -> {
-			yield handleFaqRag(state, userMessage); // RAG
+			yield handleFaqRag(state, userMessage, userId); // RAG
 		}
 		case ACCOUNT_QUERY ->
 			ChatReply.text(state.lang().equals("ar") ? "للاطّلاع على معلومات حسابك، الرجاء تسجيل الدخول."
@@ -676,7 +680,7 @@ public class ChatbotService {
 		return ChatReply.options(text, withNav(options, state.lang()));
 	}
 
-	private ChatReply handleFaqRag(EligibilityState state, String raw) {
+	private ChatReply handleFaqRag(EligibilityState state, String raw, String userId) {
 		String lang = state.lang();
 		String q = sanitizeQuery(raw);
 
@@ -693,7 +697,10 @@ public class ChatbotService {
 				: "\nSTRICT_OUTPUT: Answer ONLY in English, as plain text sentences. Do NOT return JSON, keys, or code fences.";
 
 		String answer = chatClient.prompt().system(SYSTEM + (ctx.isBlank() ? "" : "\nCONTEXT:\n" + ctx) + langDirective)
-				.user(raw).call().content();
+				.user(raw)
+				.advisors(a -> a.advisors(MessageChatMemoryAdvisor.builder(chatMemory).build())
+						.param(MessageChatMemoryAdvisor.CHAT_MEMORY_CONVERSATION_ID_KEY, userId))
+				.call().content();
 
 		answer = normalizeModelAnswer(answer, lang); // 👈 make it safe/plain
 

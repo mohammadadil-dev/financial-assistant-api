@@ -1,7 +1,6 @@
 package com.beginner_techies.chatbotapp.config;
 
 import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
 import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.chat.memory.MessageWindowChatMemory;
 import org.springframework.ai.chat.model.ChatModel;
@@ -39,9 +38,19 @@ public class AIConfig {
 		};
 		log.info("Active chat provider: {} ({})", selected, chatModel.getClass().getSimpleName());
 
-		ChatMemory chatMemory = MessageWindowChatMemory.builder().maxMessages(30) // keep last 30 messages
-				.build();
-		return ChatClient.builder(chatModel).defaultAdvisors(MessageChatMemoryAdvisor.builder(chatMemory).build())
+		return ChatClient.builder(chatModel).build();
+	}
+
+	/**
+	 * Not registered as a default advisor on the ChatClient: only the FAQ/RAG
+	 * conversation (ChatbotService) attaches this, scoped per user via
+	 * MessageChatMemoryAdvisor.CHAT_MEMORY_CONVERSATION_ID_KEY, so one user's
+	 * history never leaks into another's, and stateless calls (e.g.
+	 * IntentDetectorService) aren't polluted by unrelated chat history.
+	 */
+	@Bean
+	public ChatMemory chatMemory() {
+		return MessageWindowChatMemory.builder().maxMessages(30) // keep last 30 messages per conversation
 				.build();
 	}
 
