@@ -24,14 +24,10 @@ repositories {
 
 dependencies {
 	implementation 'org.springframework.boot:spring-boot-starter-web'
-	//implementation 'org.springframework.ai:spring-ai-openai-spring-boot-starter'
 	implementation 'org.springframework.ai:spring-ai-starter-vector-store-pinecone'
-	
 	implementation 'org.springframework.ai:spring-ai-advisors-vector-store'
-	
-	//implementation 'org.springframework.ai:spring-ai-starter-model-openai'	
-	
 	implementation 'org.springframework.ai:spring-ai-starter-model-ollama'
+	implementation 'org.springframework.ai:spring-ai-starter-model-openai'
 	implementation "io.pinecone:pinecone-client:5.1.0"
 	compileOnly 'org.projectlombok:lombok:1.18.30'
     annotationProcessor 'org.projectlombok:lombok:1.18.30'
