@@ -12,7 +12,8 @@ public class WebCorsConfig {
 		return new WebMvcConfigurer() {
 			@Override
 			public void addCorsMappings(CorsRegistry registry) {
-				registry.addMapping("/api/chat").allowedOrigins("http://localhost:3000").allowedMethods("POST");
+				registry.addMapping("/api/**").allowedOrigins("http://localhost:3000").allowedMethods("GET", "POST",
+						"OPTIONS");
 			}
 		};
 	}
