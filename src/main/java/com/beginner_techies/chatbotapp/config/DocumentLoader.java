@@ -1,12 +1,16 @@
 package com.beginner_techies.chatbotapp.config;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Component;
 
 import jakarta.annotation.PostConstruct;
@@ -15,6 +19,10 @@ import lombok.extern.slf4j.Slf4j;
 @Component
 @Slf4j
 public class DocumentLoader {
+
+	// Known-good knowledge base files under src/main/resources/knowledge/.
+	private static final List<String> KNOWLEDGE_BASE_FILES = List.of("knowledge/loans_personal_basics_en.md",
+			"knowledge/loans_personal_docs_en.md");
 
 	private final VectorStore vectorStore;
 
@@ -25,18 +33,37 @@ public class DocumentLoader {
 	@PostConstruct
 	public void loadDocuments() {
 		try {
-			// seed minimal facts
-			List<Document> docs = List.of(new Document("Loan interest rate is 7% per annum for personal loans."),
-					new Document("Required documents: National ID, Salary Certificate, Bank Statements."),
-					new Document("SAMA regulations require customer verification before loan disbursement."),
-					// Arabic variants
-					new Document("المستندات المطلوبة: الهوية الوطنية، شهادة الراتب، كشوف الحساب."),
-					new Document("تتطلب لوائح البنك المركزي السعودي (ساما) التحقق من هوية العميل قبل صرف القرض."));
+			List<Document> docs = loadKnowledgeBaseDocuments();
+			if (docs.isEmpty()) {
+				log.warn("No knowledge base documents were loaded; RAG context will be empty.");
+				return;
+			}
 			vectorStore.add(docs);
+			log.info("Seeded {} knowledge base document(s) into the vector store", docs.size());
 		} catch (Exception e) {
 			// don't crash the app if Pinecone is down; RAG will just be empty
 			log.error("RAG seed failed : {} ", e.getMessage(), e);
 		}
+	}
+
+	private List<Document> loadKnowledgeBaseDocuments() {
+		var docs = new ArrayList<Document>();
+		for (String path : KNOWLEDGE_BASE_FILES) {
+			var resource = new ClassPathResource(path);
+			if (!resource.exists()) {
+				log.warn("Knowledge base file not found on classpath: {}", path);
+				continue;
+			}
+			try (var in = resource.getInputStream()) {
+				String content = new String(in.readAllBytes(), StandardCharsets.UTF_8).trim();
+				if (!content.isEmpty()) {
+					docs.add(new Document(content, Map.of("filename", resource.getFilename())));
+				}
+			} catch (IOException e) {
+				log.error("Failed to read knowledge base file {}: {}", path, e.getMessage(), e);
+			}
+		}
+		return docs;
 	}
 
 	public List<Document> searchByLangDiversified(String query, String lang, int finalTopK, int maxPerSource) {
