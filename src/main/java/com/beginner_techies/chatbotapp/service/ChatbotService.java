@@ -58,8 +58,23 @@ public class ChatbotService {
 		this.chatMemory = chatMemory;
 	}
 
+	/**
+	 * Receives token deltas as the LLM generates them. Only LLM-backed replies
+	 * (FAQ/RAG) stream; rule-engine replies return at once without deltas.
+	 */
+	@FunctionalInterface
+	public interface TokenListener {
+		void onToken(String delta);
+	}
+
 	// ====== Public entrypoint ======
 	public ChatReply handleMessage(String userId, String userMessageRaw, String langFromClient) {
+		return handleMessage(userId, userMessageRaw, langFromClient, null);
+	}
+
+	// Streaming-aware entrypoint; listener may be null for the blocking path.
+	public ChatReply handleMessage(String userId, String userMessageRaw, String langFromClient,
+			TokenListener listener) {
 		// 0) Extract plain text (supports {"content":"..."} or {"message":"..."})
 		String raw = extractMessage(userMessageRaw);
 		String lower = raw == null ? "" : raw.trim().toLowerCase();
@@ -226,7 +241,7 @@ public class ChatbotService {
 			case AUTO ->
 				lang.equals("ar") ? "المستندات المطلوبة لتمويل سيارة" : "required documents for auto/car loan in KSA";
 			};
-			return handleFaqRag(state, seed, userId);
+			return handleFaqRag(state, seed, userId, listener);
 		}
 
 		// ---------------- keep/enter eligibility flow if needed ----------------
@@ -264,7 +279,7 @@ public class ChatbotService {
 		// ---------------- Router / LLM (only if nothing matched) ----------------
 		var intent = router.detect(raw, state.lang()); // pass RAW + detected lang
 		state = sessions.merge(userId, intent); // merge slots
-		return routeIntent(intent, state, raw, userId);
+		return routeIntent(intent, state, raw, userId, listener);
 	}
 
 	private ChatReply handleTrackApplicationStart(EligibilityState state) {
@@ -298,7 +313,8 @@ public class ChatbotService {
 	}
 
 	// ====== Routing ======
-	private ChatReply routeIntent(IntentResult intent, EligibilityState state, String userMessage, String userId) {
+	private ChatReply routeIntent(IntentResult intent, EligibilityState state, String userMessage, String userId,
+			TokenListener listener) {
 		return switch (intent.intent) {
 		case ELIGIBILITY_SLOT_UPDATE -> {
 			yield askForMissingEligibility(state); // keep in slot-filling; no RAG here
@@ -314,7 +330,7 @@ public class ChatbotService {
 			yield handleEmiCalc(state);
 		}
 		case FAQ_RAG -> {
-			yield handleFaqRag(state, userMessage, userId); // RAG
+			yield handleFaqRag(state, userMessage, userId, listener); // RAG
 		}
 		case ACCOUNT_QUERY ->
 			ChatReply.text(state.lang().equals("ar") ? "للاطّلاع على معلومات حسابك، الرجاء تسجيل الدخول."
@@ -680,7 +696,7 @@ public class ChatbotService {
 		return ChatReply.options(text, withNav(options, state.lang()));
 	}
 
-	private ChatReply handleFaqRag(EligibilityState state, String raw, String userId) {
+	private ChatReply handleFaqRag(EligibilityState state, String raw, String userId, TokenListener listener) {
 		String lang = state.lang();
 		String q = sanitizeQuery(raw);
 
@@ -696,11 +712,25 @@ public class ChatbotService {
 				? "\nSTRICT_OUTPUT: Answer ONLY in Arabic, as plain text sentences. Do NOT return JSON, keys, or code fences."
 				: "\nSTRICT_OUTPUT: Answer ONLY in English, as plain text sentences. Do NOT return JSON, keys, or code fences.";
 
-		String answer = chatClient.prompt().system(SYSTEM + (ctx.isBlank() ? "" : "\nCONTEXT:\n" + ctx) + langDirective)
+		var promptSpec = chatClient.prompt()
+				.system(SYSTEM + (ctx.isBlank() ? "" : "\nCONTEXT:\n" + ctx) + langDirective)
 				.user(raw)
 				.advisors(a -> a.advisors(MessageChatMemoryAdvisor.builder(chatMemory).build())
-						.param(MessageChatMemoryAdvisor.CHAT_MEMORY_CONVERSATION_ID_KEY, userId))
-				.call().content();
+						.param(MessageChatMemoryAdvisor.CHAT_MEMORY_CONVERSATION_ID_KEY, userId));
+
+		String answer;
+		if (listener == null) {
+			answer = promptSpec.call().content();
+		} else {
+			// Stream tokens to the listener while accumulating the full answer;
+			// blockLast() is fine here — we're on the SSE worker thread.
+			StringBuilder acc = new StringBuilder();
+			promptSpec.stream().content().doOnNext(delta -> {
+				acc.append(delta);
+				listener.onToken(delta);
+			}).blockLast();
+			answer = acc.toString();
+		}
 
 		answer = normalizeModelAnswer(answer, lang); // 👈 make it safe/plain
 
