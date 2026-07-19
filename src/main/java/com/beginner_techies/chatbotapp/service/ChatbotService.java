@@ -34,18 +34,25 @@ public class ChatbotService {
 	private final LoanService loanService;
 	private final ChatMemory chatMemory;
 
-	private static final String SYSTEM = """
-			You are a bilingual (Arabic + English) finance assistant for customers in the KSA.
-			- Be concise, professional, friendly.
-			- Match the user's language (Arabic or English).
-			- Use provided CONTEXT for factual answers; if CONTEXT is empty, say "I don't have that information."
-			- Never request or echo full sensitive data. Ask for authentication for account-specific info.
-			- Not financial advice; general guidance only.
-			""";
+	private final LeadStore leadStore;
+	private final SystemPromptProvider systemPrompt;
+	private final GuardrailService guardrails;
+	private final ChatbotTools chatbotTools;
+	private final ProductPolicy policy;
+	private final boolean toolsEnabled;
 
 	public ChatbotService(ChatClient chatClient, VectorStore vectorStore, IntentDetectorService router,
 			EligibilitySessionStore sessions, EligibilityService eligibility, FinanceTools tools,
-			RateService rateService, DocumentLoader documentLoader, LoanService loanService, ChatMemory chatMemory) {
+			RateService rateService, DocumentLoader documentLoader, LoanService loanService, ChatMemory chatMemory,
+			LeadStore leadStore, SystemPromptProvider systemPrompt, GuardrailService guardrails,
+			ChatbotTools chatbotTools, ProductPolicy policy,
+			@org.springframework.beans.factory.annotation.Value("${app.ai.tools.enabled:false}") boolean toolsEnabled) {
+		this.leadStore = leadStore;
+		this.systemPrompt = systemPrompt;
+		this.guardrails = guardrails;
+		this.chatbotTools = chatbotTools;
+		this.policy = policy;
+		this.toolsEnabled = toolsEnabled;
 		this.chatClient = chatClient;
 		this.vectorStore = vectorStore;
 		this.router = router;
@@ -92,6 +99,15 @@ public class ChatbotService {
 		}
 		String lang = state.lang();
 
+		// --- Guided flows in progress (callback / affordability / settlement).
+		// Must run BEFORE National-ID sniffing: a Saudi mobile is also 10 digits.
+		if (state.getPendingFlow() != null) {
+			ChatReply flowReply = handlePendingFlow(state, raw, userId);
+			if (flowReply != null)
+				return flowReply;
+			// null → user escaped the flow (menu/reset); continue normal routing
+		}
+
 		// --- map quick-pick ids for income → payload (defensive)
 		if ("inc10k".equalsIgnoreCase(lower))
 			raw = "ar".equals(lang) ? "دخل 10000" : "income 10000";
@@ -124,10 +140,13 @@ public class ChatbotService {
 		// missing income
 		if (!slotTouched && state.getLoanType() != null && state.getMonthlyIncome() == null) {
 			String latin = arabicDigitsToLatin(raw).replaceAll("[,\\s]", "");
-			if (latin.matches("^\\d{3,}$")) { // e.g., 8000, 12000
-				try {
-					state.setMonthlyIncome(Double.parseDouble(latin));
-					slotTouched = true;
+			if (latin.matches("^\\d{4,7}$")) { // plausible salary range only —
+				try { // a bare "60" (tenure?) must not become a 60 SAR income
+					double val = Double.parseDouble(latin);
+					if (val >= 1000 && val <= 1_000_000) {
+						state.setMonthlyIncome(val);
+						slotTouched = true;
+					}
 				} catch (NumberFormatException ignored) {
 				}
 			}
@@ -231,17 +250,39 @@ public class ChatbotService {
 			return handleEmiCalc(state);
 		}
 
-		// Docs/FAQ (RAG)
+		// Affordability — "how much can I borrow?"
+		if (isAffordCommand(lower, raw)) {
+			return startAffordability(state);
+		}
+
+		// Payment schedule (amortization summary)
+		if (isScheduleCommand(lower, raw)) {
+			return handlePaymentSchedule(state);
+		}
+
+		// Early settlement quote
+		if (isSettleCommand(lower, raw)) {
+			return startSettlement(state);
+		}
+
+		// Talk to an agent → callback lead capture
+		if (isContactCommand(lower, raw)) {
+			return startCallbackFlow(state);
+		}
+
+		// Repayment reminders (needs a linked account — offer callback instead)
+		if (lower.equals("remind") || raw.contains("تذكير بالسداد") || containsPhrase(lower, "repayment reminder")) {
+			return remindReply(state);
+		}
+
+		// Track application retry/help buttons
+		if (lower.equals("track_retry") || lower.equals("track_help")) {
+			return handleTrackApplicationStart(state);
+		}
+
+		// Documents — personalized rule-based checklist
 		if (isDocsCommand(lower, raw)) {
-			String seed = switch (state.getLoanType() == null ? LoanType.PERSONAL : state.getLoanType()) {
-			case PERSONAL ->
-				lang.equals("ar") ? "المستندات المطلوبة لتمويل شخصي" : "required documents for personal loan in KSA";
-			case MORTGAGE, HOME -> lang.equals("ar") ? "المستندات المطلوبة لتمويل عقاري"
-					: "required documents for mortgage/home loan in KSA";
-			case AUTO ->
-				lang.equals("ar") ? "المستندات المطلوبة لتمويل سيارة" : "required documents for auto/car loan in KSA";
-			};
-			return handleFaqRag(state, seed, userId, listener);
+			return docsChecklist(state);
 		}
 
 		// ---------------- keep/enter eligibility flow if needed ----------------
@@ -635,6 +676,23 @@ public class ChatbotService {
 		if (state.getLoanType() == null)
 			return loanTypeMenu(state.lang());
 
+		// Enforce the SAMA tenure limit (60 months for consumer finance)
+		if (state.getTenureMonths() != null) {
+			int maxTen = productMaxTenureMonths(state.getLoanType());
+			if (state.getTenureMonths() > maxTen)
+				state.setTenureMonths(maxTen);
+		}
+
+		// Enforce the company's nationality-aware amount cap
+		boolean amountCapped = false;
+		if (state.getAmount() != null) {
+			double capAmt = policy.maxAmount(state.getLoanType(), state.getNationality());
+			if (state.getAmount() > capAmt) {
+				state.setAmount(capAmt);
+				amountCapped = true;
+			}
+		}
+
 		// Ask for amount/tenure (ID-only suggestions; Arabic labels, empty payload)
 		if (state.getAmount() == null || state.getTenureMonths() == null) {
 			String prompt = state.lang().equals("ar")
@@ -680,6 +738,11 @@ public class ChatbotService {
 						""").formatted(emi, cur, amount, cur, tenure, rate, totalPayable, cur, interestOnly, cur)
 						.replace(" ,", ",");
 
+		if (amountCapped) {
+			text += state.lang().equals("ar") ? "\n(تم ضبط المبلغ على الحد الأقصى للمنتج وفق سياسة الشركة)"
+					: "\n(Amount adjusted to the product maximum under company policy)";
+		}
+
 		var options = new ArrayList<ChatOption>();
 		if (tenure > 12)
 			options.add(
@@ -700,23 +763,48 @@ public class ChatbotService {
 		String lang = state.lang();
 		String q = sanitizeQuery(raw);
 
+		// Session-aware retrieval: when we know the product, prefer its chunks
+		String product = state.getLoanType() == null ? null : switch (state.getLoanType()) {
+		case PERSONAL -> "personal";
+		case MORTGAGE, HOME -> "home";
+		case AUTO -> "auto";
+		};
 		List<Document> hits;
 		try {
-			hits = documentLoader.searchByLangDiversified(q, lang, 6, 2);
+			hits = documentLoader.search(q, lang, product, 6);
 		} catch (Exception e) {
 			hits = List.of();
 		}
 		String ctx = documentLoader.joinContents(hits);
 
+		// Honest no-answer fallback: without matching knowledge the model must
+		// not improvise company-specific facts (rates, fees, policy).
+		String noKbDirective = ctx.isBlank()
+				? "\nNOTE: No internal knowledge matched this question. If it concerns company-specific rates, fees, or policy, say you don't have that information and offer an agent callback. General finance education is fine."
+				: "";
+
 		String langDirective = "ar".equals(lang)
 				? "\nSTRICT_OUTPUT: Answer ONLY in Arabic, as plain text sentences. Do NOT return JSON, keys, or code fences."
 				: "\nSTRICT_OUTPUT: Answer ONLY in English, as plain text sentences. Do NOT return JSON, keys, or code fences.";
 
+		// Guardrail: prompt-injection attempts never reach the LLM
+		if (guardrails.isInjectionAttempt(raw)) {
+			return ChatReply.text("ar".equals(lang) ? "لا أستطيع المساعدة في ذلك. كيف أقدر أخدمك في تمويلك؟"
+					: "I can't help with that. How can I help you with your financing?");
+		}
+
 		var promptSpec = chatClient.prompt()
-				.system(SYSTEM + (ctx.isBlank() ? "" : "\nCONTEXT:\n" + ctx) + langDirective)
+				.system(systemPrompt.render(lang) + (ctx.isBlank() ? "" : "\nCONTEXT:\n" + ctx) + noKbDirective
+						+ langDirective)
 				.user(raw)
 				.advisors(a -> a.advisors(MessageChatMemoryAdvisor.builder(chatMemory).build())
 						.param(MessageChatMemoryAdvisor.CHAT_MEMORY_CONVERSATION_ID_KEY, userId));
+
+		// Function-calling: real EMI/affordability/status/settlement math for
+		// free-text questions (requires a tool-capable model, e.g. Groq llama-3.3)
+		if (toolsEnabled) {
+			promptSpec = promptSpec.tools(chatbotTools);
+		}
 
 		String answer;
 		if (listener == null) {
@@ -732,7 +820,8 @@ public class ChatbotService {
 			answer = acc.toString();
 		}
 
-		answer = normalizeModelAnswer(answer, lang); // 👈 make it safe/plain
+		// Normalize (strip JSON/fences) then PII-mask as the final output filter
+		answer = guardrails.maskPii(normalizeModelAnswer(answer, lang));
 
 		return ChatReply.text(answer);
 	}
@@ -784,19 +873,630 @@ public class ChatbotService {
 	}
 
 	// ====== Builders ======
+	// ====== New feature command matchers ======
+
+	private boolean isAffordCommand(String lower, String raw) {
+		return lower.equals("afford") || containsPhrase(lower, "how much can i borrow")
+				|| containsPhrase(lower, "borrowing capacity") || raw.contains("كم أقدر أقترض")
+				|| raw.contains("كم يمكنني الاقتراض") || raw.contains("كم استطيع اقترض");
+	}
+
+	private boolean isScheduleCommand(String lower, String raw) {
+		return lower.equals("schedule") || containsPhrase(lower, "payment schedule")
+				|| containsPhrase(lower, "amortization") || raw.contains("جدول السداد")
+				|| raw.contains("جدول الدفعات");
+	}
+
+	private boolean isSettleCommand(String lower, String raw) {
+		return lower.equals("faq_settle") || lower.equals("settle") || containsPhrase(lower, "early settlement")
+				|| containsPhrase(lower, "settle early") || raw.contains("السداد المبكر")
+				|| raw.contains("التسوية المبكرة");
+	}
+
+	private boolean isContactCommand(String lower, String raw) {
+		return lower.equals("contact") || containsPhrase(lower, "talk to an agent")
+				|| containsPhrase(lower, "human agent") || containsPhrase(lower, "call me back")
+				|| raw.contains("التحدث إلى موظف") || raw.contains("اتصلوا بي");
+	}
+
+	// ====== Guided flows (callback / affordability / settlement) ======
+
+	/** Handles one turn of an in-progress guided flow. Returns null when the
+	 *  user escaped (menu/reset) so normal routing continues. */
+	private ChatReply handlePendingFlow(EligibilityState state, String raw, String userId) {
+		boolean ar = state.isArabic();
+		String text = raw == null ? "" : raw.trim();
+		String lower = text.toLowerCase();
+
+		// Escape hatch: ANY global command cancels the flow and falls through to
+		// normal routing. Users click old buttons mid-flow all the time — without
+		// this, "Check eligibility" gets captured as someone's NAME and the flow
+		// traps them.
+		if (isMenuCommand(text) || lower.equals("reset") || lower.equals("start over")
+				|| text.contains("بدء من جديد") || isEligCommand(lower, text) || isEmiCommand(lower, text)
+				|| isDocsCommand(lower, text) || isAffordCommand(lower, text) || isScheduleCommand(lower, text)
+				|| isSettleCommand(lower, text) || isContactCommand(lower, text) || lower.equals("track")
+				|| lower.equals("track_retry") || lower.equals("track_help") || lower.equals("apply_loan")) {
+			state.setPendingFlow(null);
+			return null;
+		}
+
+		switch (state.getPendingFlow()) {
+
+		case "CB_NAME" -> {
+			// A real name: letters and spaces — button ids ("elig") and numbers
+			// must never be captured as a person's name
+			if (!text.matches("^[\\p{L}][\\p{L} .'’-]{1,59}$") || text.contains("_")) {
+				return flowPrompt(state, ar ? "فضلاً أدخل اسمك الكامل (حروف فقط)."
+						: "Please enter your full name (letters only).");
+			}
+			state.setCallbackName(text);
+			state.setPendingFlow("CB_MOBILE");
+			return flowPrompt(state, ar ? "شكراً " + text + "! ما رقم جوالك؟ (مثال: 05XXXXXXXX)"
+					: "Thanks " + text + "! What's your mobile number? (e.g., 05XXXXXXXX)");
+		}
+
+		case "CB_MOBILE" -> {
+			String digits = normalizeToLatinDigits(text).replaceAll("[^0-9+]", "");
+			String normalized = normalizeSaudiMobile(digits);
+			if (normalized == null) {
+				return flowPrompt(state, ar ? "الرجاء إدخال رقم جوال سعودي صالح (05XXXXXXXX أو ‎+9665XXXXXXXX)."
+						: "Please enter a valid Saudi mobile number (05XXXXXXXX or +9665XXXXXXXX).");
+			}
+			state.setCallbackMobile(normalized);
+			state.setPendingFlow("CB_TIME");
+			var opts = new ArrayList<ChatOption>();
+			opts.add(new ChatOption("cb_am", ar ? "صباحاً (9–12)" : "Morning (9–12)", ar ? "صباحاً" : "morning"));
+			opts.add(new ChatOption("cb_pm", ar ? "ظهراً (12–4)" : "Afternoon (12–4)", ar ? "ظهراً" : "afternoon"));
+			opts.add(new ChatOption("cb_eve", ar ? "مساءً (4–8)" : "Evening (4–8)", ar ? "مساءً" : "evening"));
+			return ChatReply.options(ar ? "متى تفضل أن نتصل بك؟" : "When would you like us to call?", opts);
+		}
+
+		case "CB_TIME" -> {
+			String slot = switch (lower) {
+			case "cb_am", "morning", "صباحاً" -> ar ? "صباحاً (9–12)" : "morning (9–12)";
+			case "cb_pm", "afternoon", "ظهراً" -> ar ? "ظهراً (12–4)" : "afternoon (12–4)";
+			case "cb_eve", "evening", "مساءً" -> ar ? "مساءً (4–8)" : "evening (4–8)";
+			default -> text;
+			};
+			var lead = leadStore.save(userId, state.getCallbackName(), state.getCallbackMobile(), slot);
+			state.setPendingFlow(null);
+			state.setCallbackName(null);
+			state.setCallbackMobile(null);
+			String msg = ar
+					? "تم تسجيل طلبك ✅\nرقم المرجع: **" + lead.ref() + "**\nسيتصل بك أحد مستشارينا " + slot + "."
+					: "You're all set ✅\nReference: **" + lead.ref() + "**\nOne of our advisors will call you " + slot
+							+ ".";
+			return ChatReply.options(msg, withNav(new ArrayList<>(), state.lang()));
+		}
+
+		case "DOCS_REFINE" -> {
+			// The docs checklist asked a refinement question — apply the answer
+			// and re-render the (more precise) checklist. Anything else falls
+			// through to normal routing so buttons like "Check eligibility" work.
+			boolean touched = true;
+			switch (lower) {
+			case "loan_personal" -> state.setLoanType(LoanType.PERSONAL);
+			case "loan_mortgage" -> state.setLoanType(LoanType.MORTGAGE);
+			case "loan_auto" -> state.setLoanType(LoanType.AUTO);
+			case "nat_sa" -> state.setNationality("Saudi");
+			case "nat_nonsa" -> state.setNationality("Non-Saudi");
+			case "emp_gov" -> state.setEmployerType("government");
+			case "emp_priv" -> state.setEmployerType("private");
+			case "emp_cont" -> state.setEmployerType("contract");
+			case "emp_self" -> state.setEmployerType("self-employed");
+			default -> touched = tryDirectSlotUpdate(state, text);
+			}
+			if (touched)
+				return docsChecklist(state);
+			state.setPendingFlow(null);
+			return null;
+		}
+
+		case "AFFORD_TYPE" -> {
+			LoanType chosen = switch (lower) {
+			case "loan_personal" -> LoanType.PERSONAL;
+			case "loan_mortgage" -> LoanType.MORTGAGE;
+			case "loan_auto" -> LoanType.AUTO;
+			default -> LoanType.fromText(text);
+			};
+			if (chosen == null) {
+				return flowPrompt(state, ar ? "فضلاً اختر نوع التمويل: شخصي، عقاري، أو سيارة."
+						: "Please choose a financing type: personal, home, or car.");
+			}
+			state.setLoanType(chosen);
+			if (state.getNationality() == null)
+				return askAffordNationality(state);
+			if (state.getMonthlyIncome() == null)
+				return askAffordIncome(state);
+			if (state.getOtherObligationsMonthly() == null)
+				return askObligations(state);
+			state.setPendingFlow(null);
+			return computeAffordability(state);
+		}
+
+		case "AFFORD_NAT" -> {
+			// Check the negative forms FIRST: "non-saudi" also contains "saudi"
+			boolean isNonSaudi = lower.equals("nat_nonsa") || lower.contains("non") || lower.contains("expat")
+					|| text.contains("غير") || text.contains("مقيم");
+			boolean isSaudi = !isNonSaudi
+					&& (lower.equals("nat_sa") || lower.contains("saudi") || text.contains("سعود"));
+			if (!isNonSaudi && !isSaudi) {
+				return flowPrompt(state, ar ? "فضلاً اختر: سعودي أو غير سعودي (مقيم)."
+						: "Please choose: Saudi or Expat (Non-Saudi).");
+			}
+			state.setNationality(isNonSaudi ? "Non-Saudi" : "Saudi");
+			if (state.getMonthlyIncome() == null)
+				return askAffordIncome(state);
+			if (state.getOtherObligationsMonthly() == null)
+				return askObligations(state);
+			state.setPendingFlow(null);
+			return computeAffordability(state);
+		}
+
+		case "AFFORD_INCOME" -> {
+			Double income = parseFlowNumber(text);
+			if (income == null || income < 1000 || income > 1_000_000) {
+				return flowPrompt(state, ar ? "فضلاً أدخل دخلك الشهري بالريال (مثال: 12000)."
+						: "Please enter your monthly income in SAR (e.g., 12000).");
+			}
+			state.setMonthlyIncome(income);
+			return askObligations(state);
+		}
+
+		case "AFFORD_OBLIG" -> {
+			Double obligations = (lower.equals("none") || text.contains("لا يوجد")) ? Double.valueOf(0.0)
+					: parseFlowNumber(text);
+			if (obligations == null || obligations < 0) {
+				return flowPrompt(state, ar ? "فضلاً أدخل مبلغ الالتزامات الشهرية (0 إذا لا يوجد)."
+						: "Please enter your monthly obligations amount (0 if none).");
+			}
+			state.setOtherObligationsMonthly(obligations);
+			state.setPendingFlow(null);
+			return computeAffordability(state);
+		}
+
+		case "SETTLE_MONTHS" -> {
+			Double k = parseFlowNumber(text);
+			Integer tenure = state.getTenureMonths();
+			if (k == null || tenure == null || k < 1 || k >= tenure) {
+				return flowPrompt(state, ar
+						? "فضلاً أدخل عدد الأقساط المسددة (رقم بين 1 و " + (tenure == null ? 359 : tenure - 1) + ")."
+						: "Please enter how many installments you've paid (between 1 and "
+								+ (tenure == null ? 359 : tenure - 1) + ").");
+			}
+			state.setPendingFlow(null);
+			return computeSettlement(state, k.intValue());
+		}
+
+		default -> {
+			state.setPendingFlow(null);
+			return null;
+		}
+		}
+	}
+
+	/** A flow question with the standard nav chip, so users always see a way out. */
+	private ChatReply flowPrompt(EligibilityState state, String prompt) {
+		return ChatReply.options(prompt, withNav(new ArrayList<>(), state.lang()));
+	}
+
+	private Double parseFlowNumber(String raw) {
+		if (raw == null)
+			return null;
+		String latin = normalizeToLatinDigits(raw).replaceAll("[,\\s]", "");
+		var m = java.util.regex.Pattern.compile("(\\d{1,7}(?:\\.\\d+)?)").matcher(latin);
+		if (!m.find())
+			return null;
+		try {
+			return Double.parseDouble(m.group(1));
+		} catch (NumberFormatException e) {
+			return null;
+		}
+	}
+
+	/** Accepts 05XXXXXXXX, 5XXXXXXXX, 9665XXXXXXXX, +9665XXXXXXXX → 9665XXXXXXXX */
+	private String normalizeSaudiMobile(String digits) {
+		if (digits == null)
+			return null;
+		String d = digits.replace("+", "");
+		if (d.matches("^05\\d{8}$"))
+			return "966" + d.substring(1);
+		if (d.matches("^9665\\d{8}$"))
+			return d;
+		if (d.matches("^5\\d{8}$"))
+			return "966" + d;
+		return null;
+	}
+
+	private ChatReply startCallbackFlow(EligibilityState state) {
+		boolean ar = state.isArabic();
+		state.setPendingFlow("CB_NAME");
+		return flowPrompt(state, ar ? "يسعدنا التواصل معك! 📞 ما اسمك الكريم؟"
+				: "Happy to have an advisor call you! 📞 What's your name?");
+	}
+
+	private ChatReply remindReply(EligibilityState state) {
+		boolean ar = state.isArabic();
+		var opts = new ArrayList<ChatOption>();
+		opts.add(new ChatOption("contact", ar ? "اتصلوا بي لتفعيلها" : "Call me to set it up", ""));
+		return ChatReply.options(ar
+				? "تذكيرات السداد تُرسل برسائل نصية قبل موعد القسط بثلاثة أيام، وتتطلب ربط حسابك. اطلب مكالمة من مستشار لتفعيلها."
+				: "Repayment reminders are sent by SMS 3 days before each installment and require a linked account. Request a callback and an advisor will set it up.",
+				withNav(opts, state.lang()));
+	}
+
+	// ====== Affordability ("how much can I borrow?") ======
+
+	/** SAMA responsible-lending cap on the debt burden ratio for salaried customers. */
+	private static final double DBR_CAP = 1.0 / 3.0;
+
+	private ChatReply startAffordability(EligibilityState state) {
+		boolean ar = state.isArabic();
+		// Need before capacity: ask WHAT financing they want first, then compute
+		// what they can get for that product (caps and tenure differ per product).
+		if (state.getLoanType() == null) {
+			state.setPendingFlow("AFFORD_TYPE");
+			var opts = new ArrayList<ChatOption>();
+			opts.add(new ChatOption("loan_personal", ar ? "تمويل شخصي" : "Personal Financing", ""));
+			opts.add(new ChatOption("loan_mortgage", ar ? "تمويل عقاري / رهن" : "Mortgage / Home Loan", ""));
+			opts.add(new ChatOption("loan_auto", ar ? "تمويل سيارة" : "Car Loan", ""));
+			return ChatReply.options(ar ? "لنعرف قدرتك التمويلية 💰 — أي نوع تمويل تحتاج؟"
+					: "Let's find out how much you can borrow 💰 — which type of financing do you need?", opts);
+		}
+		if (state.getNationality() == null) {
+			return askAffordNationality(state);
+		}
+		if (state.getMonthlyIncome() == null) {
+			return askAffordIncome(state);
+		}
+		if (state.getOtherObligationsMonthly() == null) {
+			return askObligations(state);
+		}
+		return computeAffordability(state);
+	}
+
+	private ChatReply askAffordNationality(EligibilityState state) {
+		boolean ar = state.isArabic();
+		state.setPendingFlow("AFFORD_NAT");
+		var opts = new ArrayList<ChatOption>();
+		opts.add(new ChatOption("nat_sa", ar ? "سعودي" : "Saudi", ""));
+		opts.add(new ChatOption("nat_nonsa", ar ? "غير سعودي (مقيم)" : "Expat (Non-Saudi)", ""));
+		return ChatReply.options(ar ? "هل أنت سعودي أم مقيم؟ (يختلف الحد الأقصى للتمويل حسب الجنسية)"
+				: "Are you Saudi or an expat? (The maximum financing amount differs by nationality.)", opts);
+	}
+
+	private ChatReply askAffordIncome(EligibilityState state) {
+		boolean ar = state.isArabic();
+		state.setPendingFlow("AFFORD_INCOME");
+		var opts = new ArrayList<ChatOption>();
+		opts.add(new ChatOption("aff10k", ar ? "10,000 ريال" : "10,000 SAR", "10000"));
+		opts.add(new ChatOption("aff15k", ar ? "15,000 ريال" : "15,000 SAR", "15000"));
+		opts.add(new ChatOption("aff20k", ar ? "20,000 ريال" : "20,000 SAR", "20000"));
+		return ChatReply.options(ar ? "كم دخلك الشهري؟ اكتب المبلغ أو اختر:"
+				: "What's your monthly income? Type it or pick:", opts);
+	}
+
+	private ChatReply askObligations(EligibilityState state) {
+		boolean ar = state.isArabic();
+		state.setPendingFlow("AFFORD_OBLIG");
+		var opts = new ArrayList<ChatOption>();
+		opts.add(new ChatOption("obl0", ar ? "لا يوجد" : "None", "0"));
+		opts.add(new ChatOption("obl1k", ar ? "1,000 ريال" : "1,000 SAR", "1000"));
+		opts.add(new ChatOption("obl2k", ar ? "2,000 ريال" : "2,000 SAR", "2000"));
+		return ChatReply.options(ar ? "كم إجمالي التزاماتك الشهرية الحالية (أقساط، بطاقات ائتمان)؟ اكتب المبلغ أو اختر:"
+				: "What are your existing monthly obligations (loans, credit cards)? Type an amount or pick:", opts);
+	}
+
+	private ChatReply computeAffordability(EligibilityState state) {
+		boolean ar = state.isArabic();
+		LoanType lt = state.getLoanType() == null ? LoanType.PERSONAL : state.getLoanType();
+		int tenure = (lt == LoanType.MORTGAGE || lt == LoanType.HOME) ? 300 : 60;
+
+		double income = state.getMonthlyIncome();
+		double obligations = state.getOtherObligationsMonthly() == null ? 0.0 : state.getOtherObligationsMonthly();
+		double maxEmi = income * DBR_CAP - obligations;
+
+		if (maxEmi < 100) {
+			var opts = new ArrayList<ChatOption>();
+			opts.add(new ChatOption("contact", ar ? "التحدث إلى موظف" : "Talk to an agent", ""));
+			return ChatReply.options(ar
+					? "بناءً على التزاماتك الحالية، هامش السداد المتاح لديك محدود جداً حالياً. يسعدنا مناقشة الخيارات معك."
+					: "Based on your current obligations there's very little room for a new installment right now. We'd be happy to discuss options with you.",
+					withNav(opts, state.lang()));
+		}
+
+		double rate = rateService.getRate(lt, 100_000, tenure, state.getEmployerType());
+		if (Double.isNaN(rate) || rate <= 0)
+			rate = fallbackRate(lt);
+		double r = rate / 1200.0;
+		double k = Math.pow(1 + r, tenure);
+		double maxLoan = Math.floor((maxEmi * (k - 1) / (r * k)) / 1000) * 1000;
+
+		// Cap by company product policy (nationality-aware)
+		double productCap = policy.maxAmount(lt, state.getNationality());
+		boolean cappedByPolicy = maxLoan > productCap;
+		if (cappedByPolicy) {
+			maxLoan = productCap;
+			// EMI shown should match the capped amount, not the DBR budget
+			maxEmi = tools.emi(maxLoan, rate, tenure);
+		}
+
+		String cur = ar ? "ريال" : "SAR";
+		String typeName = switch (lt) {
+		case PERSONAL -> ar ? "تمويل شخصي" : "personal financing";
+		case MORTGAGE, HOME -> ar ? "تمويل عقاري" : "home financing";
+		case AUTO -> ar ? "تمويل سيارة" : "auto financing";
+		};
+
+		// Save so "Calculate EMI" continues seamlessly with these numbers
+		state.setAmount(maxLoan);
+		state.setTenureMonths(tenure);
+
+		String msg = ar
+				? ("بناءً على دخل شهري %s %s والتزامات %s %s:\n\nيمكنك اقتراض حتى **%s %s** تقريباً (%s على %d شهر بمعدل %.2f%%)\nبقسط شهري أقصاه **%s %s** — وفق حد نسبة الالتزامات (33%%) من ساما.\n\n_تقدير أولي وليس عرضاً ملزماً._")
+						.formatted(fmtNum(income), cur, fmtNum(obligations), cur, fmtNum(maxLoan), cur, typeName,
+								tenure, rate, fmtNum(maxEmi), cur)
+				: ("Based on a monthly income of %s %s and obligations of %s %s:\n\nYou could borrow up to **%s %s** (%s over %d months at %.2f%%)\nwith a maximum installment of **%s %s** — per SAMA's 33%% debt-burden cap.\n\n_Indicative estimate, not a binding offer._")
+						.formatted(fmtNum(income), cur, fmtNum(obligations), cur, fmtNum(maxLoan), cur, typeName,
+								tenure, rate, fmtNum(maxEmi), cur);
+
+		if (cappedByPolicy) {
+			boolean saudi = ProductPolicy.isSaudi(state.getNationality());
+			msg += ar
+					? "\n\n(هذا هو الحد الأقصى لهذا المنتج " + (saudi ? "للسعوديين" : "للمقيمين")
+							+ " وفق سياسة الشركة)"
+					: "\n\n(This is the product maximum for " + (saudi ? "Saudi customers" : "expats")
+							+ " under company policy)";
+		}
+
+		var opts = new ArrayList<ChatOption>();
+		opts.add(new ChatOption("emi", ar ? "احسب القسط لهذا المبلغ" : "Calculate EMI for this amount", ""));
+		opts.add(new ChatOption("elig", ar ? "التحقق من الأهلية" : "Check eligibility", ""));
+		opts.add(new ChatOption("contact", ar ? "التحدث إلى موظف" : "Talk to an agent", ""));
+		return ChatReply.options(msg, withNav(opts, state.lang()));
+	}
+
+	private String fmtNum(double n) {
+		return String.format("%,.0f", n);
+	}
+
+	// ====== Payment schedule & early settlement ======
+
+	private ChatReply handlePaymentSchedule(EligibilityState state) {
+		boolean ar = state.isArabic();
+		if (state.getAmount() == null || state.getTenureMonths() == null) {
+			var opts = new ArrayList<ChatOption>();
+			opts.add(new ChatOption("emi", ar ? "حساب القسط أولاً" : "Calculate EMI first", ""));
+			return ChatReply.options(ar ? "أحتاج مبلغ التمويل والمدة أولاً — احسب القسط وسأجهز لك الجدول."
+					: "I need your loan amount and tenure first — run an EMI calculation and I'll build the schedule.",
+					withNav(opts, state.lang()));
+		}
+		double P = state.getAmount();
+		int n = state.getTenureMonths();
+		LoanType lt = state.getLoanType() == null ? LoanType.PERSONAL : state.getLoanType();
+		double rate = rateService.getRate(lt, P, n, state.getEmployerType());
+		if (Double.isNaN(rate) || rate <= 0)
+			rate = fallbackRate(lt);
+		double r = rate / 1200.0;
+		double emi = tools.emi(P, rate, n);
+		String cur = ar ? "ريال" : "SAR";
+
+		StringBuilder sb = new StringBuilder();
+		sb.append(ar
+				? "**جدول السداد** لمبلغ %s %s على %d شهر بمعدل %.2f%% — القسط **%s %s** شهرياً:\n\n".formatted(
+						fmtNum(P), cur, n, rate, fmtNum(emi), cur)
+				: "**Payment schedule** for %s %s over %d months at %.2f%% — EMI **%s %s**/month:\n\n".formatted(
+						fmtNum(P), cur, n, rate, fmtNum(emi), cur));
+
+		double balance = P;
+		int year = 1;
+		double yPrincipal = 0, yProfit = 0;
+		for (int m = 1; m <= n; m++) {
+			double profit = balance * r;
+			double principal = emi - profit;
+			balance = Math.max(0, balance - principal);
+			yPrincipal += principal;
+			yProfit += profit;
+			if (m % 12 == 0 || m == n) {
+				sb.append(ar
+						? "- السنة %d: أصل %s + أرباح %s ← المتبقي **%s %s**\n".formatted(year, fmtNum(yPrincipal),
+								fmtNum(yProfit), fmtNum(balance), cur)
+						: "- Year %d: principal %s + profit %s → balance **%s %s**\n".formatted(year,
+								fmtNum(yPrincipal), fmtNum(yProfit), fmtNum(balance), cur));
+				year++;
+				yPrincipal = 0;
+				yProfit = 0;
+			}
+		}
+		double total = emi * n;
+		sb.append(ar ? "\nالإجمالي: **%s %s** (أرباح %s %s)".formatted(fmtNum(total), cur, fmtNum(total - P), cur)
+				: "\nTotal payable: **%s %s** (profit %s %s)".formatted(fmtNum(total), cur, fmtNum(total - P), cur));
+
+		var opts = new ArrayList<ChatOption>();
+		opts.add(new ChatOption("faq_settle", ar ? "تسعيرة السداد المبكر" : "Early settlement quote", ""));
+		return ChatReply.options(sb.toString(), withNav(opts, state.lang()));
+	}
+
+	private ChatReply startSettlement(EligibilityState state) {
+		boolean ar = state.isArabic();
+		if (state.getAmount() == null || state.getTenureMonths() == null) {
+			var opts = new ArrayList<ChatOption>();
+			opts.add(new ChatOption("emi", ar ? "حساب القسط أولاً" : "Calculate EMI first", ""));
+			opts.add(new ChatOption("contact", ar ? "التحدث إلى موظف" : "Talk to an agent", ""));
+			return ChatReply.options(ar
+					? "لحساب تسعيرة السداد المبكر أحتاج تفاصيل التمويل (المبلغ والمدة). احسب القسط أولاً أو تحدث مع موظف."
+					: "To quote early settlement I need your loan details (amount & tenure). Run an EMI calc first, or talk to an agent.",
+					withNav(opts, state.lang()));
+		}
+		state.setPendingFlow("SETTLE_MONTHS");
+		var opts = new ArrayList<ChatOption>();
+		opts.add(new ChatOption("st6", ar ? "6 أقساط" : "6 paid", "6"));
+		opts.add(new ChatOption("st12", ar ? "12 قسطاً" : "12 paid", "12"));
+		opts.add(new ChatOption("st24", ar ? "24 قسطاً" : "24 paid", "24"));
+		return ChatReply.options(ar ? "كم قسطاً سددت حتى الآن؟ اكتب الرقم أو اختر:"
+				: "How many installments have you paid so far? Type a number or pick:", opts);
+	}
+
+	private ChatReply computeSettlement(EligibilityState state, int paid) {
+		boolean ar = state.isArabic();
+		double P = state.getAmount();
+		int n = state.getTenureMonths();
+		LoanType lt = state.getLoanType() == null ? LoanType.PERSONAL : state.getLoanType();
+		double rate = rateService.getRate(lt, P, n, state.getEmployerType());
+		if (Double.isNaN(rate) || rate <= 0)
+			rate = fallbackRate(lt);
+		double r = rate / 1200.0;
+		double emi = tools.emi(P, rate, n);
+
+		double pk = Math.pow(1 + r, paid);
+		double balance = P * pk - emi * (pk - 1) / r;
+		if (balance <= 0) {
+			return ChatReply.text(
+					ar ? "وفق هذه الأرقام، تمويلك مسدد بالكامل تقريباً 🎉" : "By these numbers your loan is already fully repaid 🎉");
+		}
+
+		int remaining = n - paid;
+		double fee = 0;
+		double b = balance;
+		for (int i = 0; i < Math.min(3, remaining); i++) {
+			double profit = b * r;
+			fee += profit;
+			b -= (emi - profit);
+		}
+		double total = balance + fee;
+		String cur = ar ? "ريال" : "SAR";
+
+		String msg = ar
+				? ("**تسعيرة السداد المبكر** (بعد سداد %d من %d قسطاً):\n\n- الرصيد المتبقي: **%s %s**\n- رسوم التسوية (بحد أقصى أرباح 3 أشهر وفق ساما): **%s %s**\n- الإجمالي للسداد اليوم: **%s %s**\n\n_تقدير إرشادي؛ التسعيرة النهائية من كشف حسابك._")
+						.formatted(paid, n, fmtNum(balance), cur, fmtNum(fee), cur, fmtNum(total), cur)
+				: ("**Early settlement quote** (after %d of %d installments):\n\n- Outstanding balance: **%s %s**\n- Settlement fee (capped at 3 months' profit per SAMA): **%s %s**\n- Total to settle today: **%s %s**\n\n_Indicative; the final figure comes from your account statement._")
+						.formatted(paid, n, fmtNum(balance), cur, fmtNum(fee), cur, fmtNum(total), cur);
+
+		var opts = new ArrayList<ChatOption>();
+		opts.add(new ChatOption("contact", ar ? "التحدث إلى موظف" : "Talk to an agent", ""));
+		return ChatReply.options(msg, withNav(opts, state.lang()));
+	}
+
+	// ====== Personalized document checklist ======
+
+	private ChatReply docsChecklist(EligibilityState state) {
+		boolean ar = state.isArabic();
+		LoanType lt = state.getLoanType();
+		String nat = state.getNationality();
+		String emp = state.getEmployerTypeNormalized();
+		boolean saudi = nat != null && nat.equalsIgnoreCase("Saudi");
+		boolean home = lt == LoanType.MORTGAGE || lt == LoanType.HOME;
+
+		var lines = new ArrayList<String>();
+		if (ar) {
+			lines.add(nat == null ? "بطاقة الهوية الوطنية أو الإقامة سارية المفعول"
+					: (saudi ? "بطاقة الهوية الوطنية سارية المفعول" : "إقامة سارية المفعول + جواز السفر"));
+			lines.add("تعريف بالراتب حديث (لا يتجاوز 30 يوماً)"
+					+ ("government".equals(emp) ? " مصدق من جهة العمل الحكومية" : ""));
+			if ("self-employed".equals(emp))
+				lines.add("السجل التجاري + كشف حساب بنكي 6–12 شهراً");
+			else
+				lines.add("كشف حساب بنكي لآخر 3 أشهر");
+			if ("contract".equals(emp))
+				lines.add("نسخة من عقد العمل");
+			if (home)
+				lines.add("مستندات العقار (عرض البيع، الصك) + تقرير تثمين معتمد");
+			if (lt == LoanType.AUTO)
+				lines.add("عرض سعر السيارة من المعرض");
+		} else {
+			lines.add(nat == null ? "Valid National ID or Iqama"
+					: (saudi ? "Valid National ID" : "Valid Iqama + passport"));
+			lines.add("Recent salary certificate (≤ 30 days)"
+					+ ("government".equals(emp) ? ", attested by your government employer" : ""));
+			if ("self-employed".equals(emp))
+				lines.add("Commercial registration + 6–12 months of bank statements");
+			else
+				lines.add("Bank statements for the last 3 months");
+			if ("contract".equals(emp))
+				lines.add("Copy of your employment contract");
+			if (home)
+				lines.add("Property documents (sale offer, deed) + accredited valuation report");
+			if (lt == LoanType.AUTO)
+				lines.add("Car quotation from the dealer");
+		}
+
+		StringBuilder sb = new StringBuilder(ar ? "**المستندات المطلوبة**" : "**Required documents**");
+		String ctx = describeChecklistContext(state, ar);
+		if (!ctx.isBlank())
+			sb.append(" — ").append(ctx);
+		sb.append(":\n\n");
+		for (String l : lines)
+			sb.append("- ").append(l).append('\n');
+
+		// Progressive refinement: ask for the most impactful missing detail with
+		// buttons, re-rendering this checklist after each answer (DOCS_REFINE flow)
+		var opts = new ArrayList<ChatOption>();
+		boolean refine = true;
+		if (lt == null) {
+			sb.append('\n').append(ar ? "_لأي نوع تمويل؟ اختر لقائمة أدق:_" : "_For which financing? Pick for a precise list:_");
+			opts.add(new ChatOption("loan_personal", ar ? "تمويل شخصي" : "Personal Financing", ""));
+			opts.add(new ChatOption("loan_mortgage", ar ? "تمويل عقاري" : "Mortgage / Home", ""));
+			opts.add(new ChatOption("loan_auto", ar ? "تمويل سيارة" : "Car Loan", ""));
+		} else if (nat == null) {
+			sb.append('\n').append(ar ? "_هل أنت سعودي أم مقيم؟_" : "_Are you Saudi or an expat?_");
+			opts.add(new ChatOption("nat_sa", ar ? "سعودي" : "Saudi", ""));
+			opts.add(new ChatOption("nat_nonsa", ar ? "غير سعودي (مقيم)" : "Expat (Non-Saudi)", ""));
+		} else if (emp == null) {
+			sb.append('\n').append(ar ? "_ما جهة عملك؟_" : "_What's your employer type?_");
+			opts.add(new ChatOption("emp_gov", ar ? "حكومي" : "Government", ""));
+			opts.add(new ChatOption("emp_priv", ar ? "قطاع خاص" : "Private", ""));
+			opts.add(new ChatOption("emp_cont", ar ? "متعاقد" : "Contract", ""));
+			opts.add(new ChatOption("emp_self", ar ? "عمل حر" : "Self-employed", ""));
+		} else {
+			refine = false;
+			opts.add(new ChatOption("elig", ar ? "التحقق من الأهلية" : "Check eligibility", ""));
+		}
+		state.setPendingFlow(refine ? "DOCS_REFINE" : null);
+		opts.add(new ChatOption("contact", ar ? "التحدث إلى موظف" : "Talk to an agent", ""));
+		return ChatReply.options(sb.toString(), withNav(opts, state.lang()));
+	}
+
+	private String describeChecklistContext(EligibilityState state, boolean ar) {
+		var parts = new ArrayList<String>();
+		if (state.getLoanType() != null) {
+			parts.add(switch (state.getLoanType()) {
+			case PERSONAL -> ar ? "تمويل شخصي" : "personal financing";
+			case MORTGAGE, HOME -> ar ? "تمويل عقاري" : "home financing";
+			case AUTO -> ar ? "تمويل سيارة" : "auto financing";
+			});
+		}
+		if (state.getNationality() != null) {
+			parts.add(ar ? (state.getNationality().equalsIgnoreCase("Saudi") ? "سعودي" : "غير سعودي")
+					: state.getNationality());
+		}
+		String emp = state.getEmployerTypeNormalized();
+		if (emp != null) {
+			parts.add(switch (emp) {
+			case "government" -> ar ? "موظف حكومي" : "government employee";
+			case "private" -> ar ? "قطاع خاص" : "private sector";
+			case "contract" -> ar ? "متعاقد" : "contractor";
+			case "self-employed" -> ar ? "عمل حر" : "self-employed";
+			default -> emp;
+			});
+		}
+		return String.join(" • ", parts);
+	}
+
 	private ChatReply assistanceMenu(String lang) {
 		if ("ar".equals(lang)) {
 			return ChatReply.options("مرحباً! أنا مساعدك المالي. كيف أستطيع مساعدتك اليوم؟",
-					withNav(List.of(new ChatOption("elig", "التحقق من أهلية التمويل", ""),
+					withNav(List.of(new ChatOption("afford", "كم أقدر أقترض؟", ""),
+							new ChatOption("elig", "التحقق من أهلية التمويل", ""),
 							new ChatOption("emi", "حاسبة القسط الشهري (EMI)", ""),
-							new ChatOption("track", "متابعة الطلب", ""), // ← NEW
+							new ChatOption("track", "متابعة الطلب", ""),
 							new ChatOption("docs", "الأسئلة الشائعة / المستندات", ""),
 							new ChatOption("lang_en", "English", "")), "ar"));
 		}
 		return ChatReply.options("Hey! I’m your finance assistant. How can I help you today?",
-				withNav(List.of(new ChatOption("elig", "Check Loan Eligibility", ""),
-						new ChatOption("emi", "Calculate EMI", ""), new ChatOption("track", "Track application", ""), // ←
-																														// NEW
+				withNav(List.of(new ChatOption("afford", "How much can I borrow?", ""),
+						new ChatOption("elig", "Check Loan Eligibility", ""),
+						new ChatOption("emi", "Calculate EMI", ""), new ChatOption("track", "Track application", ""),
 						new ChatOption("docs", "FAQs / Documents", ""), new ChatOption("lang_ar", "العربية", "")),
 						"en"));
 	}
@@ -811,7 +1511,7 @@ public class ChatbotService {
 		return ChatReply.options("Which type of loan would you like?",
 				withNav(List.of(new ChatOption("loan_personal", "Personal Financing", ""),
 						new ChatOption("loan_mortgage", "Mortgage / Home Loan", ""),
-						new ChatOption("loan_auto", "Car / Auto Loan", "")), "en"));
+						new ChatOption("loan_auto", "Car Loan", "")), "en"));
 	}
 
 	private ChatReply afterLoanTypeChosen(EligibilityState state) {
@@ -819,7 +1519,7 @@ public class ChatbotService {
 		String t = switch (state.getLoanType()) {
 		case PERSONAL -> lang.equals("ar") ? "تمويل شخصي" : "Personal Financing";
 		case MORTGAGE, HOME -> lang.equals("ar") ? "تمويل عقاري / رهن" : "Mortgage / Home Loan";
-		case AUTO -> lang.equals("ar") ? "تمويل سيارة" : "Car / Auto Loan";
+		case AUTO -> lang.equals("ar") ? "تمويل سيارة" : "Car Loan";
 		};
 		if ("ar".equals(lang)) {
 			return ChatReply.options("تم اختيار: " + t + ". ماذا تريد أن تفعل الآن?",
@@ -1075,12 +1775,20 @@ public class ChatbotService {
 			touched = true;
 		}
 
-		// 4) Existing loans yes/no (loans yes/no / قروض موجودة نعم/لا)
-		if (containsAny(lower, "loans yes", "قروض موجودة نعم", "yes")) {
+		// 4) Existing loans yes/no — ONLY exact answers or explicit loan-context
+		// phrases. Bare substring matching here was a live bug: "yesterday"
+		// contains "yes", and Arabic "لا" appears inside countless words
+		// (السلام، الطلب…), silently flipping this flag on unrelated messages.
+		String answer = lower.trim();
+		boolean saysYesLoans = answer.equals("yes") || answer.equals("نعم")
+				|| containsAny(lower, "loans yes", "have loans", "قروض موجودة نعم", "عندي قروض", "لدي قروض");
+		boolean saysNoLoans = answer.equals("no") || answer.equals("لا") || answer.equals("لا يوجد")
+				|| containsAny(lower, "loans no", "no loans", "no existing loans", "قروض موجودة لا",
+						"لا يوجد قروض", "ما عندي قروض");
+		if (saysYesLoans) {
 			state.setHasExistingLoans(true);
 			touched = true;
-		}
-		if (containsAny(lower, "loans no", "قروض موجودة لا", "no", "لا")) {
+		} else if (saysNoLoans) {
 			state.setHasExistingLoans(false);
 			touched = true;
 		}
@@ -1211,18 +1919,14 @@ public class ChatbotService {
 	private int defaultTenureMonths(LoanType t) {
 		return switch (t) {
 		case PERSONAL -> 48; // 4 years
-		case AUTO -> 60; // 5 years
-		case MORTGAGE, HOME -> 240; // 20 years (adjust if your bank uses 25 years → 300)
+		case AUTO -> 60; // product not offered; kept for enum completeness
+		case MORTGAGE, HOME -> 240; // 20 years
 		};
 	}
 
-	// Product caps (optional, tune to your bank’s policy)
-	private double productMaxAmount(LoanType t) {
-		return switch (t) {
-		case PERSONAL -> 50_000.0;
-		case AUTO -> 20_000.0;
-		case MORTGAGE, HOME -> 2_000_000.0;
-		};
+	/** SAMA tenure limit — delegated to ProductPolicy. */
+	private int productMaxTenureMonths(LoanType t) {
+		return policy.maxTenureMonths(t);
 	}
 
 	// Invert EMI formula to compute principal P from EMI, monthly rate r, and n
@@ -1252,16 +1956,16 @@ public class ChatbotService {
 		double income = Math.max(0, s.getMonthlyIncome());
 		double other = (s.getOtherObligationsMonthly() == null) ? 0.0 : Math.max(0, s.getOtherObligationsMonthly());
 
-		// If your verdict filled suggestedDtiCap, use it; otherwise pick a safe cap
-		// ~40%
-		double dtiCap = (v != null && v.suggestedDtiCap != null) ? v.suggestedDtiCap : 0.40;
-		dtiCap = Math.max(0.25, Math.min(0.50, dtiCap));
+		// Verdict cap if present, else SAMA's 33.33% salaried debt-burden cap
+		double dtiCap = (v != null && v.suggestedDtiCap != null) ? v.suggestedDtiCap : (1.0 / 3.0);
+		dtiCap = Math.max(0.20, Math.min(1.0 / 3.0, dtiCap)); // never exceed the SAMA cap
 
 		// Max *new* EMI budget (income * cap minus existing obligations)
 		double maxNewEmi = Math.max(0.0, dtiCap * income - other);
 
-		// Choose tenure and APR
+		// Choose tenure (clamped to the product/SAMA limit) and APR
 		int n = (s.getTenureMonths() != null) ? s.getTenureMonths() : defaultTenureMonths(s.getLoanType());
+		n = Math.min(n, productMaxTenureMonths(s.getLoanType()));
 		double apr = rateService.getRate(s.getLoanType(),
 				// we don't know amount yet, pass a rough guess
 				Math.max(50_000, s.getAmount() == null ? 50_000 : s.getAmount()), n, s.getEmployerType());
@@ -1272,12 +1976,15 @@ public class ChatbotService {
 		// Compute principal offer from EMI budget
 		double rawAmount = principalFromEmi(maxNewEmi, apr, n);
 
-		// Clamp to product caps
-		double cap = productMaxAmount(s.getLoanType());
-		double offerAmount = Math.min(rawAmount, cap);
+		// Clamp to the company's nationality-aware product cap, apply a ~5%
+		// conservative haircut, THEN round to the nearest 1,000
+		double cap = policy.maxAmount(s.getLoanType(), s.getNationality());
+		double offerAmount = Math.floor(Math.min(rawAmount, cap) * 0.95 / 1000.0) * 1000.0;
 
-		// Be a bit conservative (optionally haircut by ~5%)
-		offerAmount = Math.max(0.0, Math.floor(offerAmount / 1000.0) * 1000.0 * 0.95);
+		// An "offer" below any meaningful financing amount is worse than none —
+		// callers treat a null offer as "no offer line" and still show next steps.
+		if (offerAmount < 10_000.0)
+			return null;
 
 		// Recompute EMI from final amount (so EMI aligns with rounded amount)
 		double emi = tools.emi(offerAmount, apr, n);

@@ -12,6 +12,7 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import com.beginner_techies.chatbotapp.record.ChatReply;
+import com.beginner_techies.chatbotapp.service.AuditService;
 import com.beginner_techies.chatbotapp.service.ChatbotService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -36,11 +37,13 @@ public class ChatStreamController {
 	private static final long TIMEOUT_MS = 120_000L;
 
 	private final ChatbotService chatbotService;
+	private final AuditService audit;
 	private final ObjectMapper mapper = new ObjectMapper();
 	private final ExecutorService executor = Executors.newCachedThreadPool();
 
-	public ChatStreamController(ChatbotService chatbotService) {
+	public ChatStreamController(ChatbotService chatbotService, AuditService audit) {
 		this.chatbotService = chatbotService;
+		this.audit = audit;
 	}
 
 	@PostMapping(value = "/api/chat/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
@@ -57,8 +60,10 @@ public class ChatStreamController {
 
 		executor.execute(() -> {
 			try {
+				audit.turn(userId, "in", req.content());
 				ChatReply reply = chatbotService.handleMessage(userId, req.content(), req.lang(),
 						delta -> send(emitter, "delta", Map.of("text", delta)));
+				audit.turn(userId, "out", reply == null ? "" : reply.text());
 				send(emitter, "final", reply);
 				emitter.complete();
 			} catch (ClientDisconnectedException e) {

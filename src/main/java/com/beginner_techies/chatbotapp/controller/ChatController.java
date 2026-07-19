@@ -7,6 +7,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.beginner_techies.chatbotapp.record.ChatReply;
+import com.beginner_techies.chatbotapp.service.AuditService;
 import com.beginner_techies.chatbotapp.service.ChatbotService;
 
 import lombok.extern.slf4j.Slf4j;
@@ -24,6 +25,9 @@ public class ChatController {
 	@Autowired
 	private ChatbotService chatbotService;
 
+	@Autowired
+	private AuditService audit;
+
 	@PostMapping("/api/chat")
 	public ResponseEntity<?> promptRequest(@RequestBody ChatRequest req) {
 		try {
@@ -31,7 +35,9 @@ public class ChatController {
 				return ResponseEntity.badRequest().body(new ApiError("BadRequest", "content is required"));
 			}
 			String userId = (req.sender() == null || req.sender().isBlank()) ? "anonymous" : req.sender();
+			audit.turn(userId, "in", req.content());
 			ChatReply reply = chatbotService.handleMessage(userId, req.content(), req.lang());
+			audit.turn(userId, "out", reply == null ? "" : reply.text());
 			return ResponseEntity.ok(reply);
 		} catch (Exception e) {
 			log.error("chat error", e);

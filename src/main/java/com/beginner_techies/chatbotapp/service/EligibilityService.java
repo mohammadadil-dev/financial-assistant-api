@@ -38,19 +38,22 @@ public class EligibilityService {
         double other = s.getOtherObligationsMonthly() == null ? 0.0 : Math.max(0, s.getOtherObligationsMonthly());
         boolean isSaudi = isSaudi(s.getNationality());
 
-        // ---- Policy thresholds (adjust to your bank)
+        // ---- Policy thresholds
         double minIncome;
         int minService;
-        // base DTI cap (commitments/income); we then apply penalties
+        // Base DTI cap (commitments/income). SAMA Responsible Lending caps the
+        // debt burden ratio at 33.33% of gross salary for employees (25% for
+        // retirees) — internal policy may only tighten below that, never exceed.
+        final double SAMA_DBR_CAP = 1.0 / 3.0;
         double baseDtiCap = switch (emp) {
-            case "government" -> 0.45;
-            case "private"    -> 0.40;
+            case "government",
+                 "private"    -> SAMA_DBR_CAP;
             case "contract",
-                 "self-employed" -> 0.35;
-            default           -> 0.40;
+                 "self-employed" -> 0.30;
+            default           -> SAMA_DBR_CAP;
         };
         // Nationality tightening
-        if (!isSaudi) baseDtiCap -= 0.05; // e.g., 40% → 35%
+        if (!isSaudi) baseDtiCap -= 0.05;
 
         // Income & service thresholds by employer + nationality
         if (emp.equals("government")) {
@@ -69,7 +72,7 @@ public class EligibilityService {
 
         // Existing loans penalty on DTI cap (tighter)
         double dtiCap = baseDtiCap - (hasLoans ? 0.05 : 0.0);
-        dtiCap = clamp(dtiCap, 0.25, 0.50); // safety bounds
+        dtiCap = clamp(dtiCap, 0.20, 1.0 / 3.0); // never above the SAMA 33.33% cap
 
         // ---- Deterministic checks
         if (income < minIncome) v.reasons.add("LOW_INCOME");
@@ -116,7 +119,10 @@ public class EligibilityService {
     private static boolean isSaudi(String nationality) {
         if (nationality == null) return true; // default neutral
         String n = nationality.trim().toLowerCase();
-        return n.contains("saudi") || n.contains("سعود");
+        // "non-saudi" CONTAINS "saudi" — check the negative forms first, or
+        // expats get evaluated with the looser Saudi thresholds
+        boolean negative = n.contains("non") || n.contains("غير");
+        return !negative && (n.contains("saudi") || n.contains("سعود"));
     }
 
     private static double clamp(double x, double lo, double hi) {
