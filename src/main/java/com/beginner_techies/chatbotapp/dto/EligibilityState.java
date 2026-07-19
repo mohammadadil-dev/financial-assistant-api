@@ -141,6 +141,38 @@ public class EligibilityState {
 		this.annualRate = annualRate;
 	}
 
+	// ---------------- Multi-step flow state ----------------
+	// Non-null while a guided flow is collecting input, e.g. CB_NAME/CB_MOBILE/
+	// CB_TIME (agent callback), AFFORD_INCOME/AFFORD_OBLIG (affordability),
+	// SETTLE_MONTHS (early settlement).
+	private String pendingFlow;
+	private String callbackName;
+	private String callbackMobile;
+
+	public String getPendingFlow() {
+		return pendingFlow;
+	}
+
+	public void setPendingFlow(String pendingFlow) {
+		this.pendingFlow = pendingFlow;
+	}
+
+	public String getCallbackName() {
+		return callbackName;
+	}
+
+	public void setCallbackName(String callbackName) {
+		this.callbackName = callbackName;
+	}
+
+	public String getCallbackMobile() {
+		return callbackMobile;
+	}
+
+	public void setCallbackMobile(String callbackMobile) {
+		this.callbackMobile = callbackMobile;
+	}
+
 	// ---------------- Convenience / Flow helpers ----------------
 
 	/** The minimum we need before we can run an eligibility evaluation. */
